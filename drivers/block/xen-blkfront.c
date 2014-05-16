@@ -45,6 +45,7 @@
 #include <linux/scatterlist.h>
 #include <linux/bitmap.h>
 #include <linux/list.h>
+#include <linux/blk-mq.h>
 
 #include <xen/xen.h>
 #include <xen/xenbus.h>
@@ -58,6 +59,8 @@
 #include <xen/interface/io/protocols.h>
 
 #include <asm/xen/hypervisor.h>
+
+#include "xen-blkback/common.h"	/* for struct blkif_x86_64_request */
 
 enum blkif_state {
 	BLKIF_STATE_DISCONNECTED,
@@ -132,6 +135,7 @@ struct blkfront_info
 	unsigned int discard_granularity;
 	unsigned int discard_alignment;
 	unsigned int feature_persistent:1;
+	unsigned int feature_multiqueue:1;
 	unsigned int max_indirect_segments;
 	int is_ready;
 };
@@ -590,6 +594,36 @@ static inline bool blkif_request_flush_mismatch(struct request *req,
 		!info->flush_op));
 }
 
+static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
+{
+	struct blkfront_info *info = req->rq_disk->private_data;
+
+	pr_debug("Entered blkif_queue_rq\n");
+
+	if (RING_FULL(&info->ring))
+		goto wait;
+
+	if (blkif_request_flush_mismatch(req, info)) {
+		req->errors = -EIO;
+		blk_mq_complete_request(req);
+		return BLK_MQ_RQ_QUEUE_ERROR;
+	}
+
+	if (blkif_queue_request(req)) {
+wait:
+		/*
+		 * Only stop the hardware queue; the block layer
+		 * will take care of requeueing the request when
+		 * seeing the return value.
+		 */
+		blk_mq_stop_hw_queue(hctx);
+		return BLK_MQ_RQ_QUEUE_BUSY;
+	}
+
+	flush_requests(info);
+	return BLK_MQ_RQ_QUEUE_OK;
+}
+
 /*
  * do_blkif_request
  *  read a block; request is in a request queue
@@ -638,6 +672,32 @@ wait:
 		flush_requests(info);
 }
 
+static inline void blkif_complete(struct request *req)
+{
+	blk_mq_end_io(req, req->errors);
+}
+
+static struct blk_mq_ops blkfront_mq_ops = {
+	.queue_rq	= blkif_queue_rq,
+	.map_queue	= blk_mq_map_queue,
+	.alloc_hctx	= blk_mq_alloc_single_hw_queue,
+	.free_hctx	= blk_mq_free_single_hw_queue,
+	.complete	= blkif_complete,
+};
+
+static struct blk_mq_reg blkfront_mq_reg = {
+	.ops		= &blkfront_mq_ops,
+	/*
+	 * see blkfront_connect() for the initialization of
+	 * the following three fields
+	 */
+	.nr_hw_queues	= 0,
+	.queue_depth	= 0,
+	.cmd_size	= 0,
+	.numa_node	= NUMA_NO_NODE,
+	.flags		= BLK_MQ_F_SHOULD_MERGE,
+};
+
 static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 				unsigned int physical_sector_size,
 				unsigned int segments)
@@ -645,7 +705,10 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 	struct request_queue *rq;
 	struct blkfront_info *info = gd->private_data;
 
-	rq = blk_init_queue(do_blkif_request, &info->io_lock);
+	if (!info->feature_multiqueue)
+		rq = blk_init_queue(do_blkif_request, &info->io_lock);
+	else
+		rq = blk_mq_init_queue(&blkfront_mq_reg, info);
 	if (rq == NULL)
 		return -1;
 
@@ -902,10 +965,12 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 static void kick_pending_request_queues(struct blkfront_info *info)
 {
 	if (!RING_FULL(&info->ring)) {
-		/* Re-enable calldowns. */
-		blk_start_queue(info->rq);
-		/* Kick things off immediately. */
-		do_blkif_request(info->rq);
+		/* Re-enable calldowns and kick things off immediately. */
+		if (!info->feature_multiqueue) {
+			blk_start_queue(info->rq);
+			do_blkif_request(info->rq);
+		} else
+			blk_mq_start_stopped_hw_queues(info->rq);
 	}
 }
 
@@ -1156,37 +1221,40 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 			continue;
 		}
 
-		error = (bret->status == BLKIF_RSP_OKAY) ? 0 : -EIO;
+		error = req->errors = (bret->status == BLKIF_RSP_OKAY) ? 0 : -EIO;
 		switch (bret->operation) {
 		case BLKIF_OP_DISCARD:
 			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP)) {
 				struct request_queue *rq = info->rq;
 				printk(KERN_WARNING "blkfront: %s: %s op failed\n",
 					   info->gd->disk_name, op_name(bret->operation));
-				error = -EOPNOTSUPP;
+				error = req->errors = -EOPNOTSUPP;
 				info->feature_discard = 0;
 				info->feature_secdiscard = 0;
 				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
 				queue_flag_clear(QUEUE_FLAG_SECDISCARD, rq);
 			}
-			__blk_end_request_all(req, error);
+			if (!info->feature_multiqueue)
+				__blk_end_request_all(req, error);
+			else
+				blk_mq_complete_request(req);
 			break;
 		case BLKIF_OP_FLUSH_DISKCACHE:
 		case BLKIF_OP_WRITE_BARRIER:
 			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP)) {
 				printk(KERN_WARNING "blkfront: %s: %s op failed\n",
 				       info->gd->disk_name, op_name(bret->operation));
-				error = -EOPNOTSUPP;
+				error = req->errors = -EOPNOTSUPP;
 			}
 			if (unlikely(bret->status == BLKIF_RSP_ERROR &&
 				     info->shadow[id].req.u.rw.nr_segments == 0)) {
 				printk(KERN_WARNING "blkfront: %s: empty %s op failed\n",
 				       info->gd->disk_name, op_name(bret->operation));
-				error = -EOPNOTSUPP;
+				error = req->errors = -EOPNOTSUPP;
 			}
 			if (unlikely(error)) {
 				if (error == -EOPNOTSUPP)
-					error = 0;
+					error = req->errors = 0;
 				info->feature_flush = 0;
 				info->flush_op = 0;
 				xlvbd_flush(info);
@@ -1198,7 +1266,10 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				dev_dbg(&info->xbdev->dev, "Bad return from blkdev data "
 					"request: %x\n", bret->status);
 
-			__blk_end_request_all(req, error);
+			if (!info->feature_multiqueue)
+				__blk_end_request_all(req, error);
+			else
+				blk_mq_complete_request(req);
 			break;
 		default:
 			BUG();
@@ -1870,6 +1941,21 @@ static void blkfront_connect(struct blkfront_info *info)
 		xenbus_dev_fatal(info->xbdev, err, "setup_indirect at %s",
 				 info->xbdev->otherend);
 		return;
+	}
+
+	/* XXX actually gather this from the backend */
+	info->feature_multiqueue = 1;
+	/*
+	 * TODO: if the backend is mq-compatible, gather also the number of
+	 *       hardware queues (blkfront_mq_reg.nr_hw_queues).
+	 */
+	if (info->feature_multiqueue) {
+		blkfront_mq_reg.nr_hw_queues = 1;
+		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
+					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
+					      BLK_RING_SIZE;
+		blkfront_mq_reg.cmd_size = max(sizeof(struct blkif_request),
+					sizeof(struct blkif_x86_64_request));
 	}
 
 	err = xlvbd_alloc_gendisk(sectors, info, binfo, sector_size,
