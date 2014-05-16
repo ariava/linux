@@ -586,6 +586,14 @@ static inline void flush_requests(struct blkfront_info *info)
 		notify_remote_via_irq(info->irq);
 }
 
+static inline bool blkif_request_flush_mismatch(struct request *req,
+						struct blkfront_info *info)
+{
+	return ((req->cmd_type != REQ_TYPE_FS) ||
+		((req->cmd_flags & (REQ_FLUSH | REQ_FUA)) &&
+		!info->flush_op));
+}
+
 /*
  * do_blkif_request
  *  read a block; request is in a request queue
@@ -608,9 +616,7 @@ static void do_blkif_request(struct request_queue *rq)
 
 		blk_start_request(req);
 
-		if ((req->cmd_type != REQ_TYPE_FS) ||
-		    ((req->cmd_flags & (REQ_FLUSH | REQ_FUA)) &&
-		    !info->flush_op)) {
+		if (blkif_request_flush_mismatch(req, info)) {
 			__blk_end_request_all(req, -EIO);
 			continue;
 		}
@@ -646,9 +652,7 @@ static int blkfront_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 	if (RING_FULL(&info->ring))
 		goto wait;
 
-	if ((req->cmd_type != REQ_TYPE_FS) ||
-			((req->cmd_flags & (REQ_FLUSH | REQ_FUA)) &&
-			 !info->flush_op)) {
+	if (blkif_request_flush_mismatch(req, info)) {
 		req->errors = -EIO;
 		blk_mq_complete_request(req);
 		spin_unlock_irq(&info->io_lock);
