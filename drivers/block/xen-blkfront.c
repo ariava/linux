@@ -1947,7 +1947,8 @@ static void blkfront_connect(struct blkfront_info *info)
 	info->feature_multiqueue = 1;
 	/*
 	 * TODO: if the backend is mq-compatible, gather also the number of
-	 *       hardware queues (blkfront_mq_reg.nr_hw_queues).
+	 *       hardware queues (blkfront_mq_reg.nr_hw_queues), e.g., change
+	 *       the feature_multiqueue bitfield to be a real unsigned int.
 	 */
 	if (info->feature_multiqueue) {
 		blkfront_mq_reg.nr_hw_queues = 1;
