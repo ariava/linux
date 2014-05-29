@@ -178,7 +178,9 @@ static DEFINE_SPINLOCK(minor_lock);
 #define INDIRECT_GREFS(_segs) \
 	((_segs + SEGS_PER_INDIRECT_FRAME - 1)/SEGS_PER_INDIRECT_FRAME)
 
-static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo);
+static int blkfront_gather_indirect(struct blkfront_info *info);
+static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo,
+				   unsigned int segs);
 
 static int get_id_from_freelist(struct blkfront_ring_info *rinfo)
 {
@@ -1586,10 +1588,12 @@ static int blkif_recover(struct blkfront_info *info)
 	struct split_bio *split_bio;
 	struct list_head requests;
 
+	segs = blkfront_gather_indirect(info);
+
 	for (r = 0 ; r < info->nr_rings ; i++) {
 		rc |= blkif_setup_shadow(&info->rinfo[i], &copy);
 
-		rc |= blkfront_setup_indirect(&info->rinfo[i]);
+		rc |= blkfront_setup_indirect(&info->rinfo[i], segs);
 		if (rc) {
 			kfree(copy);
 			return rc;
@@ -1801,15 +1805,15 @@ static void blkfront_setup_discard(struct blkfront_info *info)
 	kfree(type);
 }
 
-static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo)
-{
-	struct blkfront_info *info = rinfo->info;
-	unsigned int indirect_segments, segs;
-	int err, i;
 
-	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
-			    "feature-max-indirect-segments", "%u", &indirect_segments,
-			    NULL);
+static int blkfront_gather_indirect(struct blkfront_info *info)
+{
+	unsigned int indirect_segments, segs;
+	int err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
+				"feature-max-indirect-segments", "%u",
+				&indirect_segments,
+				NULL);
+
 	if (err) {
 		info->max_indirect_segments = 0;
 		segs = BLKIF_MAX_SEGMENTS_PER_REQUEST;
@@ -1818,6 +1822,15 @@ static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo)
 						  xen_blkif_max_segments);
 		segs = info->max_indirect_segments;
 	}
+
+	return segs;
+}
+
+static int blkfront_setup_indirect(struct blkfront_ring_info *rinfo,
+				   unsigned int segs)
+{
+	struct blkfront_info *info = rinfo->info;
+	int err, i;
 
 	err = fill_grant_buffer(info, (segs + INDIRECT_GREFS(segs)) * BLK_RING_SIZE);
 	if (err)
@@ -1890,6 +1903,7 @@ static void blkfront_connect(struct blkfront_info *info)
 	unsigned long sector_size;
 	unsigned int physical_sector_size;
 	unsigned int binfo;
+	unsigned int segs;
 	int i, err;
 	int barrier, flush, discard, persistent;
 
@@ -2021,9 +2035,10 @@ static void blkfront_connect(struct blkfront_info *info)
 					sizeof(struct blkfront_ring_info),
 				       GFP_KERNEL);
 
+	segs = blkfront_gather_indirect(info);
 	for (i = 0 ; i < info->nr_rings ; i++) {
 		info->rinfo[i].info = info;
-		err = blkfront_setup_indirect(&info->rinfo[i]);
+		err = blkfront_setup_indirect(&info->rinfo[i], segs);
 		if (err) {
 			xenbus_dev_fatal(info->xbdev, err, "setup_indirect at %s",
 					 info->xbdev->otherend);
