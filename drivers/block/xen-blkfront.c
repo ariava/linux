@@ -944,6 +944,8 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 	return err;
 }
 
+void blk_mq_free_queue(struct request_queue *q);
+
 static void xlvbd_release_gendisk(struct blkfront_info *info)
 {
 	unsigned int minor, nr_minors;
@@ -955,7 +957,10 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	spin_lock_irqsave(&info->io_lock, flags);
 
 	/* No more blkif_request(). */
-	blk_stop_queue(info->rq);
+	if (!info->feature_multiqueue)
+		blk_stop_queue(info->rq);
+	else
+		blk_mq_stop_hw_queues(info->rq);
 
 	/* No more gnttab callback work. */
 	gnttab_cancel_free_callback(&info->callback);
@@ -970,7 +975,10 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	nr_minors = info->gd->minors;
 	xlbd_release_minors(minor, nr_minors);
 
-	blk_cleanup_queue(info->rq);
+	if (!info->feature_multiqueue)
+		blk_cleanup_queue(info->rq);
+	else
+		blk_mq_free_queue(info->rq);
 	info->rq = NULL;
 
 	put_disk(info->gd);
