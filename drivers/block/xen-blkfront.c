@@ -1631,26 +1631,28 @@ static int blkif_recover(struct blkfront_info *info)
 	}
 
 	/*
-	 * Empty the queue, this is important because we might have
-	 * requests in the queue with more segments than what we
-	 * can handle now.
+	 * If we are using the request interface, empty the queue,
+	 * this is important because we might have requests in the
+	 * queue with more segments than what we can handle now.
 	 */
-	spin_lock_irq(&info->io_lock);
-	while ((req = blk_fetch_request(info->rq)) != NULL) {
-		if (req->cmd_flags &
-		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
-			list_add(&req->queuelist, &requests);
-			continue;
+	if (!info->feature_multiqueue) {
+		spin_lock_irq(&info->io_lock);
+		while ((req = blk_fetch_request(info->rq)) != NULL) {
+			if (req->cmd_flags &
+			    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
+				list_add(&req->queuelist, &requests);
+				continue;
+			}
+			merge_bio.head = req->bio;
+			merge_bio.tail = req->biotail;
+			bio_list_merge(&bio_list, &merge_bio);
+			req->bio = NULL;
+			if (req->cmd_flags & (REQ_FLUSH | REQ_FUA))
+				pr_alert("diskcache flush request found!\n");
+			__blk_put_request(info->rq, req);
 		}
-		merge_bio.head = req->bio;
-		merge_bio.tail = req->biotail;
-		bio_list_merge(&bio_list, &merge_bio);
-		req->bio = NULL;
-		if (req->cmd_flags & (REQ_FLUSH | REQ_FUA))
-			pr_alert("diskcache flush request found!\n");
-		__blk_put_request(info->rq, req);
+		spin_unlock_irq(&info->io_lock);
 	}
-	spin_unlock_irq(&info->io_lock);
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
@@ -1662,6 +1664,11 @@ static int blkif_recover(struct blkfront_info *info)
 	/* Kick any other new requests queued since we resumed */
 	kick_pending_request_queues(info);
 
+	/*
+	 * XXX this is most certainly buggy: we are in fact expected
+	 *     to handle requests queued in hctxs; also note, in case
+	 *     feature_multiqueue is enabled here requests is empty
+	 */
 	list_for_each_entry_safe(req, n, &requests, queuelist) {
 		/* Requeue pending requests (flush or discard) */
 		list_del_init(&req->queuelist);
