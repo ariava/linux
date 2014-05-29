@@ -1088,8 +1088,12 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 	info->connected = suspend ?
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
 	/* No more blkif_request(). */
-	if (info->rq)
-		blk_stop_queue(info->rq);
+	if (info->rq) {
+		if (!info->feature_multiqueue)
+			blk_stop_queue(info->rq);
+		else
+			blk_mq_stop_hw_queues(info->rq);
+	}
 
 	/* Remove all persistent grants */
 	if (!list_empty(&info->grants)) {
