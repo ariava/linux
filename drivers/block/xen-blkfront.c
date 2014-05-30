@@ -112,6 +112,7 @@ struct blkfront_ring_info
 	unsigned long shadow_free;
 
 	struct blkfront_info *info;
+	unsigned int hctx_index;
 };
 
 /*
@@ -611,10 +612,12 @@ static inline bool blkif_request_flush_mismatch(struct request *req,
 static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 {
 	struct blkfront_info *info = req->rq_disk->private_data;
+	struct blkfront_ring_info *rinfo =
+			(struct blkfront_ring_info *)hctx->driver_data;
 
 	pr_debug("Entered blkif_queue_rq\n");
 
-	if (RING_FULL(&info->rinfo[0].ring))
+	if (RING_FULL(&rinfo->ring))
 		goto wait;
 
 	if (blkif_request_flush_mismatch(req, info)) {
@@ -623,7 +626,7 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 		return BLK_MQ_RQ_QUEUE_ERROR;
 	}
 
-	if (blkif_queue_request(req, 0)) {
+	if (blkif_queue_request(req, rinfo->hctx_index)) {
 wait:
 		/*
 		 * Only stop the hardware queue; the block layer
@@ -634,7 +637,7 @@ wait:
 		return BLK_MQ_RQ_QUEUE_BUSY;
 	}
 
-	flush_requests(info, 0);
+	flush_requests(info, rinfo->hctx_index);
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
@@ -692,11 +695,23 @@ static inline void blkif_complete(struct request *req)
 	blk_mq_end_io(req, req->errors);
 }
 
+static int blkfront_init_hctx(struct blk_mq_hw_ctx *hctx, void *driver_data,
+			      unsigned int hctx_index)
+{
+	struct blkfront_info *info = (struct blkfront_info *)driver_data;
+
+	hctx->driver_data = &info->rinfo[hctx_index];
+	info->rinfo[hctx_index].hctx_index = hctx_index;
+
+	return 0;
+}
+
 static struct blk_mq_ops blkfront_mq_ops = {
 	.queue_rq	= blkif_queue_rq,
 	.map_queue	= blk_mq_map_queue,
 	.alloc_hctx	= blk_mq_alloc_single_hw_queue,
 	.free_hctx	= blk_mq_free_single_hw_queue,
+	.init_hctx	= blkfront_init_hctx,
 	.complete	= blkif_complete,
 };
 
