@@ -626,6 +626,7 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 		return BLK_MQ_RQ_QUEUE_ERROR;
 	}
 
+	spin_lock_irq(&info->io_lock);
 	if (blkif_queue_request(req, rinfo->hctx_index)) {
 wait:
 		/*
@@ -638,6 +639,7 @@ wait:
 	}
 
 	flush_requests(info, rinfo->hctx_index);
+	spin_unlock_irq(&info->io_lock);
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
