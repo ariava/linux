@@ -226,6 +226,7 @@ struct xen_vbd {
 	struct block_device	*bdev;
 	/* Cached size parameter. */
 	sector_t		size;
+	unsigned int		nr_supported_hw_queues;
 	unsigned int		flush_support:1;
 	unsigned int		discard_secure:1;
 	unsigned int		feature_gnt_persistent:1;
