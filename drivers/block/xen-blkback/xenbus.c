@@ -449,6 +449,9 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	if (q && blk_queue_secdiscard(q))
 		vbd->discard_secure = true;
 
+	if (q && q->mq_ops)
+		vbd->nr_supported_hw_queues = q->nr_hw_queues;
+
 	DPRINTK("Successful creation of handle=%04x (dom=%u)\n",
 		handle, blkif->domid);
 	return 0;
@@ -829,6 +832,12 @@ again:
 			    bdev_physical_block_size(be->blkif->vbd.bdev));
 	if (err)
 		xenbus_dev_error(dev, err, "writing %s/physical-sector-size",
+				 dev->nodename);
+
+	err = xenbus_printf(xbt, dev->nodename, "nr_supported_hw_queues", "%u",
+			    be->blkif->vbd.nr_supported_hw_queues);
+	if (err)
+		xenbus_dev_error(dev, err, "writing %s/nr_supported_hw_queues",
 				 dev->nodename);
 
 	err = xenbus_transaction_end(xbt, 0);
