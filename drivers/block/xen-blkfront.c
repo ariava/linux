@@ -144,7 +144,7 @@ struct blkfront_info
 	unsigned int discard_granularity;
 	unsigned int discard_alignment;
 	unsigned int feature_persistent:1;
-	unsigned int feature_multiqueue:1;
+	unsigned int nr_hw_queues;
 	unsigned int max_indirect_segments;
 	int is_ready;
 };
@@ -737,7 +737,7 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 	struct request_queue *rq;
 	struct blkfront_info *info = gd->private_data;
 
-	if (!info->feature_multiqueue)
+	if (info->nr_hw_queues == 0)
 		rq = blk_init_queue(do_blkif_request, &info->io_lock);
 	else
 		rq = blk_mq_init_queue(&blkfront_mq_reg, info);
@@ -974,7 +974,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	spin_lock_irqsave(&info->io_lock, flags);
 
 	/* No more blkif_request(). */
-	if (!info->feature_multiqueue)
+	if (info->nr_hw_queues == 0)
 		blk_stop_queue(info->rq);
 	else
 		blk_mq_stop_hw_queues(info->rq);
@@ -992,7 +992,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	nr_minors = info->gd->minors;
 	xlbd_release_minors(minor, nr_minors);
 
-	if (!info->feature_multiqueue)
+	if (info->nr_hw_queues == 0)
 		blk_cleanup_queue(info->rq);
 	else
 		blk_mq_free_queue(info->rq);
@@ -1011,7 +1011,7 @@ static void kick_pending_request_queues(struct blkfront_info *info)
 			/*
 			 * Re-enable calldowns and kick things off immediately.
 			 */
-			if (!info->feature_multiqueue) {
+			if (info->nr_hw_queues == 0) {
 				blk_start_queue(info->rq);
 				do_blkif_request(info->rq);
 			} else {
@@ -1106,7 +1106,7 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
 	/* No more blkif_request(). */
 	if (info->rq) {
-		if (!info->feature_multiqueue)
+		if (info->nr_hw_queues == 0)
 			blk_stop_queue(info->rq);
 		else
 			blk_mq_stop_hw_queues(info->rq);
@@ -1298,7 +1298,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
 				queue_flag_clear(QUEUE_FLAG_SECDISCARD, rq);
 			}
-			if (!info->feature_multiqueue)
+			if (info->nr_hw_queues == 0)
 				__blk_end_request_all(req, error);
 			else
 				blk_mq_complete_request(req);
@@ -1330,7 +1330,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				dev_dbg(&info->xbdev->dev, "Bad return from blkdev data "
 					"request: %x\n", bret->status);
 
-			if (!info->feature_multiqueue)
+			if (info->nr_hw_queues == 0)
 				__blk_end_request_all(req, error);
 			else
 				blk_mq_complete_request(req);
@@ -1664,7 +1664,7 @@ static int blkif_recover(struct blkfront_info *info)
 	 * this is important because we might have requests in the
 	 * queue with more segments than what we can handle now.
 	 */
-	if (!info->feature_multiqueue) {
+	if (info->nr_hw_queues == 0) {
 		spin_lock_irq(&info->io_lock);
 		while ((req = blk_fetch_request(info->rq)) != NULL) {
 			if (req->cmd_flags &
@@ -1940,6 +1940,7 @@ static void blkfront_connect(struct blkfront_info *info)
 	unsigned int physical_sector_size;
 	unsigned int binfo;
 	unsigned int segs;
+	unsigned int nr_queues;
 	int i, err;
 	int barrier, flush, discard, persistent;
 
@@ -2044,15 +2045,15 @@ static void blkfront_connect(struct blkfront_info *info)
 	else
 		info->feature_persistent = persistent;
 
-	/* XXX actually gather this from the backend */
-	info->feature_multiqueue = 1;
-	/*
-	 * TODO: if the backend is mq-compatible, gather also the number of
-	 *       hardware queues (blkfront_mq_reg.nr_hw_queues), e.g., change
-	 *       the feature_multiqueue bitfield to be a real unsigned int.
-	 */
-	if (info->feature_multiqueue) {
-		blkfront_mq_reg.nr_hw_queues = 1;
+	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
+			    "nr_supported_hw_queues", "%u", &nr_queues,
+			    NULL);
+	if (err)
+		info->nr_hw_queues = 0;
+	else
+		info->nr_hw_queues = nr_queues;
+	if (info->nr_hw_queues > 1) {
+		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
 		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
 					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
 					      BLK_RING_SIZE;
