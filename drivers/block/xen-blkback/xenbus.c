@@ -66,9 +66,11 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 {
 	int err;
 	char name[TASK_COMM_LEN];
+	/* XXX */
+	struct xen_blkif_ring *ring = &blkif->ring[0];
 
 	/* Not ready to connect? */
-	if (!blkif->irq || !blkif->vbd.bdev)
+	if (!ring->irq || !blkif->vbd.bdev)
 		return;
 
 	/* Already connected? */
@@ -93,20 +95,91 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	}
 	invalidate_inode_pages2(blkif->vbd.bdev->bd_inode->i_mapping);
 
-	blkif->xenblkd = kthread_run(xen_blkif_schedule, blkif, "%s", name);
-	if (IS_ERR(blkif->xenblkd)) {
-		err = PTR_ERR(blkif->xenblkd);
-		blkif->xenblkd = NULL;
+	/* XXX change name and run in a for loop when going to multi-queue */
+	BUG_ON(blkif->vbd.nr_supported_hw_queues > 1);
+
+	ring->xenblkd = kthread_run(xen_blkif_schedule, &blkif->ring[0], "%s", name);
+	if (IS_ERR(ring->xenblkd)) {
+		err = PTR_ERR(ring->xenblkd);
+		ring->xenblkd = NULL;
 		xenbus_dev_error(blkif->be->dev, err, "start xenblkd");
 		return;
 	}
 }
 
+static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
+						   int nr_rings)
+{
+	struct xen_blkif_ring *rings = krealloc(blkif->ring,
+				nr_rings * sizeof(struct xen_blkif_ring),
+				GFP_KERNEL);
+	int r, i, j;
+	struct pending_req *req, *n;
+
+	if (!rings)
+		return NULL;
+
+	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
+		struct xen_blkif_ring *ring = &rings[r];
+		init_waitqueue_head(&ring->wq);
+		init_waitqueue_head(&ring->waiting_to_free);
+		init_waitqueue_head(&ring->shutdown_wq);
+		blkif->st_print = jiffies;
+		for (i = 0; i < XEN_BLKIF_REQS; i++) {
+			req = kzalloc(sizeof(*req), GFP_KERNEL);
+			if (!req)
+				goto fail;
+			list_add_tail(&req->free_list,
+			              &ring->pending_free);
+			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
+				req->segments[j] = kzalloc(sizeof(*req->segments[0]),
+				                           GFP_KERNEL);
+				if (!req->segments[j])
+					goto fail;
+			}
+			for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
+				req->indirect_pages[j] = kzalloc(sizeof(*req->indirect_pages[0]),
+				                                 GFP_KERNEL);
+				if (!req->indirect_pages[j])
+					goto fail;
+			}
+		}
+		spin_lock_init(&ring->pending_free_lock);
+		init_waitqueue_head(&ring->pending_free_wq);
+
+		INIT_LIST_HEAD(&ring->pending_free);
+		ring->blkif = blkif;
+	}
+
+	blkif->allocated_rings = nr_rings;
+
+	return rings;
+
+fail:
+	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
+		struct xen_blkif_ring *ring = &rings[r];
+		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
+			list_del(&req->free_list);
+			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
+				if (!req->segments[j])
+					break;
+				kfree(req->segments[j]);
+			}
+			for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
+				if (!req->indirect_pages[j])
+					break;
+				kfree(req->indirect_pages[j]);
+			}
+			kfree(req);
+		}
+	}
+
+	return NULL;
+}
+
 static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 {
 	struct xen_blkif *blkif;
-	struct pending_req *req, *n;
-	int i, j;
 
 	BUILD_BUG_ON(MAX_INDIRECT_PAGES > BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST);
 
@@ -114,81 +187,46 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	if (!blkif)
 		return ERR_PTR(-ENOMEM);
 
+	/*
+	 * Allocate a dummy ring, since we still don't know how many hardware
+	 * queues we have.
+	 */
+	if (!xen_blkif_ring_alloc(blkif, 1))
+		goto fail;
+
 	blkif->domid = domid;
 	spin_lock_init(&blkif->blk_ring_lock);
 	atomic_set(&blkif->refcnt, 1);
-	init_waitqueue_head(&blkif->wq);
-	init_completion(&blkif->drain_complete);
 	atomic_set(&blkif->drain, 0);
-	blkif->st_print = jiffies;
-	init_waitqueue_head(&blkif->waiting_to_free);
+	init_completion(&blkif->drain_complete);
+	atomic_set(&blkif->inflight, 0);
 	blkif->persistent_gnts.rb_node = NULL;
 	spin_lock_init(&blkif->free_pages_lock);
 	INIT_LIST_HEAD(&blkif->free_pages);
 	INIT_LIST_HEAD(&blkif->persistent_purge_list);
 	blkif->free_pages_num = 0;
 	atomic_set(&blkif->persistent_gnt_in_use, 0);
-	atomic_set(&blkif->inflight, 0);
 	INIT_WORK(&blkif->persistent_purge_work, xen_blkbk_unmap_purged_grants);
-
-	INIT_LIST_HEAD(&blkif->pending_free);
-
-	for (i = 0; i < XEN_BLKIF_REQS; i++) {
-		req = kzalloc(sizeof(*req), GFP_KERNEL);
-		if (!req)
-			goto fail;
-		list_add_tail(&req->free_list,
-		              &blkif->pending_free);
-		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
-			req->segments[j] = kzalloc(sizeof(*req->segments[0]),
-			                           GFP_KERNEL);
-			if (!req->segments[j])
-				goto fail;
-		}
-		for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
-			req->indirect_pages[j] = kzalloc(sizeof(*req->indirect_pages[0]),
-			                                 GFP_KERNEL);
-			if (!req->indirect_pages[j])
-				goto fail;
-		}
-	}
-	spin_lock_init(&blkif->pending_free_lock);
-	init_waitqueue_head(&blkif->pending_free_wq);
-	init_waitqueue_head(&blkif->shutdown_wq);
 
 	return blkif;
 
 fail:
-	list_for_each_entry_safe(req, n, &blkif->pending_free, free_list) {
-		list_del(&req->free_list);
-		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
-			if (!req->segments[j])
-				break;
-			kfree(req->segments[j]);
-		}
-		for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
-			if (!req->indirect_pages[j])
-				break;
-			kfree(req->indirect_pages[j]);
-		}
-		kfree(req);
-	}
-
 	kmem_cache_free(xen_blkif_cachep, blkif);
 
 	return ERR_PTR(-ENOMEM);
 }
 
-static int xen_blkif_map(struct xen_blkif *blkif, unsigned long shared_page,
+static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 			 unsigned int evtchn)
 {
 	int err;
+	struct xen_blkif *blkif = ring->blkif;
 
 	/* Already connected through? */
-	if (blkif->irq)
+	if (ring->irq)
 		return 0;
 
-	err = xenbus_map_ring_valloc(blkif->be->dev, shared_page, &blkif->blk_ring);
+	err = xenbus_map_ring_valloc(ring->blkif->be->dev, shared_page, &ring->blk_ring);
 	if (err < 0)
 		return err;
 
@@ -196,22 +234,22 @@ static int xen_blkif_map(struct xen_blkif *blkif, unsigned long shared_page,
 	case BLKIF_PROTOCOL_NATIVE:
 	{
 		struct blkif_sring *sring;
-		sring = (struct blkif_sring *)blkif->blk_ring;
-		BACK_RING_INIT(&blkif->blk_rings.native, sring, PAGE_SIZE);
+		sring = (struct blkif_sring *)ring->blk_ring;
+		BACK_RING_INIT(&ring->blk_rings.native, sring, PAGE_SIZE);
 		break;
 	}
 	case BLKIF_PROTOCOL_X86_32:
 	{
 		struct blkif_x86_32_sring *sring_x86_32;
-		sring_x86_32 = (struct blkif_x86_32_sring *)blkif->blk_ring;
-		BACK_RING_INIT(&blkif->blk_rings.x86_32, sring_x86_32, PAGE_SIZE);
+		sring_x86_32 = (struct blkif_x86_32_sring *)ring->blk_ring;
+		BACK_RING_INIT(&ring->blk_rings.x86_32, sring_x86_32, PAGE_SIZE);
 		break;
 	}
 	case BLKIF_PROTOCOL_X86_64:
 	{
 		struct blkif_x86_64_sring *sring_x86_64;
-		sring_x86_64 = (struct blkif_x86_64_sring *)blkif->blk_ring;
-		BACK_RING_INIT(&blkif->blk_rings.x86_64, sring_x86_64, PAGE_SIZE);
+		sring_x86_64 = (struct blkif_x86_64_sring *)ring->blk_ring;
+		BACK_RING_INIT(&ring->blk_rings.x86_64, sring_x86_64, PAGE_SIZE);
 		break;
 	}
 	default:
@@ -222,35 +260,39 @@ static int xen_blkif_map(struct xen_blkif *blkif, unsigned long shared_page,
 						    xen_blkif_be_int, 0,
 						    "blkif-backend", blkif);
 	if (err < 0) {
-		xenbus_unmap_ring_vfree(blkif->be->dev, blkif->blk_ring);
-		blkif->blk_rings.common.sring = NULL;
+		xenbus_unmap_ring_vfree(blkif->be->dev, ring->blk_ring);
+		ring->blk_rings.common.sring = NULL;
 		return err;
 	}
-	blkif->irq = err;
+	ring->irq = err;
 
 	return 0;
 }
 
 static void xen_blkif_disconnect(struct xen_blkif *blkif)
 {
-	if (blkif->xenblkd) {
-		kthread_stop(blkif->xenblkd);
-		wake_up(&blkif->shutdown_wq);
-		blkif->xenblkd = NULL;
-	}
+	int i;
 
-	atomic_dec(&blkif->refcnt);
-	wait_event(blkif->waiting_to_free, atomic_read(&blkif->refcnt) == 0);
-	atomic_inc(&blkif->refcnt);
+	for (i = 0 ; i < blkif->vbd.nr_supported_hw_queues ; i++) {
+		struct xen_blkif_ring *ring = &blkif->ring[i];
+		if (ring->xenblkd) {
+			kthread_stop(ring->xenblkd);
+			wake_up(&ring->shutdown_wq);
+			ring->xenblkd = NULL;
+		}
+		atomic_dec(&blkif->refcnt);
+		wait_event(ring->waiting_to_free, atomic_read(&blkif->refcnt) == 0);
+		atomic_inc(&blkif->refcnt);
 
-	if (blkif->irq) {
-		unbind_from_irqhandler(blkif->irq, blkif);
-		blkif->irq = 0;
-	}
+		if (ring->irq) {
+			unbind_from_irqhandler(ring->irq, ring);
+			ring->irq = 0;
+		}
 
-	if (blkif->blk_rings.common.sring) {
-		xenbus_unmap_ring_vfree(blkif->be->dev, blkif->blk_ring);
-		blkif->blk_rings.common.sring = NULL;
+		if (ring->blk_rings.common.sring) {
+			xenbus_unmap_ring_vfree(blkif->be->dev, ring->blk_ring);
+			ring->blk_rings.common.sring = NULL;
+		}
 	}
 }
 
@@ -273,21 +315,26 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 	BUG_ON(!list_empty(&blkif->free_pages));
 	BUG_ON(!RB_EMPTY_ROOT(&blkif->persistent_gnts));
 
-	/* Check that there is no request in use */
-	list_for_each_entry_safe(req, n, &blkif->pending_free, free_list) {
-		list_del(&req->free_list);
+	for (i = 0 ; i < blkif->vbd.nr_supported_hw_queues ; i++) {
+		struct xen_blkif_ring *ring = &blkif->ring[i];
+		/* Check that there is no request in use */
+		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
+			list_del(&req->free_list);
 
-		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++)
-			kfree(req->segments[j]);
+			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++)
+				kfree(req->segments[j]);
 
-		for (j = 0; j < MAX_INDIRECT_PAGES; j++)
-			kfree(req->indirect_pages[j]);
+			for (j = 0; j < MAX_INDIRECT_PAGES; j++)
+				kfree(req->indirect_pages[j]);
 
-		kfree(req);
-		i++;
+			kfree(req);
+			i++;
+		}
 	}
 
 	WARN_ON(i != XEN_BLKIF_REQS);
+
+	kfree(blkif->ring);
 
 	kmem_cache_free(xen_blkif_cachep, blkif);
 }
@@ -432,6 +479,10 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 
 	if (q && q->mq_ops)
 		vbd->nr_supported_hw_queues = q->nr_hw_queues;
+
+	if (vbd->nr_supported_hw_queues > 1)
+		if (!xen_blkif_ring_alloc(blkif, vbd->nr_supported_hw_queues))
+			return -ENOMEM;
 
 	DPRINTK("Successful creation of handle=%04x (dom=%u)\n",
 		handle, blkif->domid);
@@ -878,8 +929,10 @@ static int connect_ring(struct backend_info *be)
 		ring_ref, evtchn, be->blkif->blk_protocol, protocol,
 		pers_grants ? "persistent grants" : "");
 
+	/* XXX gather appropriate names from frontend as soon as switching to > 1 */
+
 	/* Map the shared frame, irq etc. */
-	err = xen_blkif_map(be->blkif, ring_ref, evtchn);
+	err = xen_blkif_map(&be->blkif->ring[0], ring_ref, evtchn);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "mapping ring-ref %lu port %u",
 				 ring_ref, evtchn);

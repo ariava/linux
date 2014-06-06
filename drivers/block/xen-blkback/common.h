@@ -257,32 +257,51 @@ struct persistent_gnt {
 	struct list_head remove_node;
 };
 
+struct xen_blkif_ring {
+	union blkif_back_rings	blk_rings;
+	/* Physical parameters of the comms window. */
+	unsigned int		irq;
+
+	wait_queue_head_t	wq;
+	/* One thread per one blkif. */
+	struct task_struct	*xenblkd;
+	unsigned int		waiting_reqs;
+	void			*blk_ring;
+
+	wait_queue_head_t	waiting_to_free;
+	/* Thread shutdown wait queue. */
+	wait_queue_head_t	shutdown_wq;
+
+	/* List of all 'pending_req' available */
+	struct list_head	pending_free;
+	/* And its spinlock. */
+	spinlock_t		pending_free_lock;
+	wait_queue_head_t	pending_free_wq;
+
+	struct xen_blkif	*blkif;
+};
+
 struct xen_blkif {
 	/* Unique identifier for this interface. */
 	domid_t			domid;
 	unsigned int		handle;
-	/* Physical parameters of the comms window. */
-	unsigned int		irq;
 	/* Comms information. */
 	enum blkif_protocol	blk_protocol;
-	union blkif_back_rings	blk_rings;
-	void			*blk_ring;
 	/* The VBD attached to this interface. */
 	struct xen_vbd		vbd;
+	/* Rings for this device */
+	struct xen_blkif_ring	*ring;
+	unsigned int		allocated_rings;
 	/* Back pointer to the backend_info. */
 	struct backend_info	*be;
 	/* Private fields. */
 	spinlock_t		blk_ring_lock;
 	atomic_t		refcnt;
 
-	wait_queue_head_t	wq;
 	/* for barrier (drain) requests */
 	struct completion	drain_complete;
 	atomic_t		drain;
 	atomic_t		inflight;
-	/* One thread per one blkif. */
-	struct task_struct	*xenblkd;
-	unsigned int		waiting_reqs;
 
 	/* tree to store persistent grants */
 	struct rb_root		persistent_gnts;
@@ -299,12 +318,6 @@ struct xen_blkif {
 	int			free_pages_num;
 	struct list_head	free_pages;
 
-	/* List of all 'pending_req' available */
-	struct list_head	pending_free;
-	/* And its spinlock. */
-	spinlock_t		pending_free_lock;
-	wait_queue_head_t	pending_free_wq;
-
 	/* statistics */
 	unsigned long		st_print;
 	unsigned long long			st_rd_req;
@@ -314,10 +327,6 @@ struct xen_blkif {
 	unsigned long long			st_ds_req;
 	unsigned long long			st_rd_sect;
 	unsigned long long			st_wr_sect;
-
-	wait_queue_head_t	waiting_to_free;
-	/* Thread shutdown wait queue. */
-	wait_queue_head_t	shutdown_wq;
 };
 
 struct seg_buf {
@@ -339,7 +348,7 @@ struct grant_page {
  * response queued for it, with the saved 'id' passed back.
  */
 struct pending_req {
-	struct xen_blkif	*blkif;
+	struct xen_blkif_ring	*ring;
 	u64			id;
 	int			nr_pages;
 	atomic_t		pendcnt;
@@ -359,10 +368,10 @@ struct pending_req {
 			  get_capacity((_v)->bdev->bd_disk))
 
 #define xen_blkif_get(_b) (atomic_inc(&(_b)->refcnt))
-#define xen_blkif_put(_b)				\
+#define xen_blkif_put(_b, _c)				\
 	do {						\
 		if (atomic_dec_and_test(&(_b)->refcnt))	\
-			wake_up(&(_b)->waiting_to_free);\
+			wake_up(&(_c)->waiting_to_free);\
 	} while (0)
 
 struct phys_req {
