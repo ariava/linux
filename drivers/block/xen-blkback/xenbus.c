@@ -110,21 +110,25 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 						   int nr_rings)
 {
+	int r, i, j;
+	struct pending_req *req, *n;
 	struct xen_blkif_ring *rings = krealloc(blkif->ring,
 				nr_rings * sizeof(struct xen_blkif_ring),
 				GFP_KERNEL);
-	int r, i, j;
-	struct pending_req *req, *n;
 
 	if (!rings)
 		return NULL;
+
+	printk(KERN_CRIT "XEN allocated %d rings\n", nr_rings);
 
 	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
 		init_waitqueue_head(&ring->wq);
 		init_waitqueue_head(&ring->waiting_to_free);
 		init_waitqueue_head(&ring->shutdown_wq);
+		init_waitqueue_head(&ring->pending_free_wq);
 		blkif->st_print = jiffies;
+		INIT_LIST_HEAD(&ring->pending_free);
 		for (i = 0; i < XEN_BLKIF_REQS; i++) {
 			req = kzalloc(sizeof(*req), GFP_KERNEL);
 			if (!req)
@@ -145,9 +149,6 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 			}
 		}
 		spin_lock_init(&ring->pending_free_lock);
-		init_waitqueue_head(&ring->pending_free_wq);
-
-		INIT_LIST_HEAD(&ring->pending_free);
 		ring->blkif = blkif;
 	}
 
