@@ -1039,7 +1039,11 @@ __do_block_io_op(struct xen_blkif_ring *ring)
 	RING_IDX rc, rp;
 	int more_to_do = 0;
 
+	printk(KERN_CRIT "XEN __do_block_io_op: ring %p\n", ring);
+
+	BUG_ON(blk_rings == NULL);
 	rc = blk_rings->common.req_cons;
+	BUG_ON(blk_rings->common.sring == NULL);
 	rp = blk_rings->common.sring->req_prod;
 	rmb(); /* Ensure we see queued requests up to 'rp'. */
 

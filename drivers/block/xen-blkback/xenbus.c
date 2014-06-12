@@ -98,7 +98,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	/* XXX change name and run in a for loop when going to multi-queue */
 	BUG_ON(blkif->vbd.nr_supported_hw_queues > 1);
 
-	ring->xenblkd = kthread_run(xen_blkif_schedule, &blkif->ring[0], "%s", name);
+	ring->xenblkd = kthread_run(xen_blkif_schedule, ring, "%s", name);
 	if (IS_ERR(ring->xenblkd)) {
 		err = PTR_ERR(ring->xenblkd);
 		ring->xenblkd = NULL;
@@ -112,22 +112,27 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 {
 	int r, i, j;
 	struct pending_req *req, *n;
-	struct xen_blkif_ring *rings = krealloc(blkif->ring,
-				nr_rings * sizeof(struct xen_blkif_ring),
-				GFP_KERNEL);
+	struct xen_blkif_ring *rings;
+
+	if (nr_rings == blkif->allocated_rings)
+		return blkif->ring;
+
+	rings = krealloc(blkif->ring, nr_rings * sizeof(struct xen_blkif_ring),
+			 GFP_KERNEL);
 
 	if (!rings)
 		return NULL;
 
-	printk(KERN_CRIT "XEN allocated %d rings\n", nr_rings);
+	printk(KERN_CRIT "XEN allocated %d rings at %p\n", nr_rings, rings);
 
 	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
+
+		printk(KERN_CRIT "XEN working on alloc ring %d\n", r);
 		init_waitqueue_head(&ring->wq);
 		init_waitqueue_head(&ring->waiting_to_free);
 		init_waitqueue_head(&ring->shutdown_wq);
 		init_waitqueue_head(&ring->pending_free_wq);
-		blkif->st_print = jiffies;
 		INIT_LIST_HEAD(&ring->pending_free);
 		for (i = 0; i < XEN_BLKIF_REQS; i++) {
 			req = kzalloc(sizeof(*req), GFP_KERNEL);
@@ -157,7 +162,7 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	return rings;
 
 fail:
-	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
+	for (r = 0 ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
 		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
 			list_del(&req->free_list);
@@ -192,7 +197,8 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	 * Allocate a dummy ring, since we still don't know how many hardware
 	 * queues we have.
 	 */
-	if (!xen_blkif_ring_alloc(blkif, 1))
+	blkif->ring = xen_blkif_ring_alloc(blkif, 1);
+	if (!blkif->ring)
 		goto fail;
 
 	blkif->domid = domid;
@@ -208,6 +214,7 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	blkif->free_pages_num = 0;
 	atomic_set(&blkif->persistent_gnt_in_use, 0);
 	INIT_WORK(&blkif->persistent_purge_work, xen_blkbk_unmap_purged_grants);
+	blkif->st_print = jiffies;
 
 	return blkif;
 
@@ -221,15 +228,22 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 			 unsigned int evtchn)
 {
 	int err;
-	struct xen_blkif *blkif = ring->blkif;
+	struct xen_blkif *blkif;
 
 	/* Already connected through? */
-	if (ring->irq)
+	if (!ring || ring->irq) {
+		printk(KERN_CRIT "XEN blkif map blkif not connected\n");
 		return 0;
+	}
+	printk(KERN_CRIT "XEN blkif map blkif connected\n");
+
+	blkif = ring->blkif;
 
 	err = xenbus_map_ring_valloc(ring->blkif->be->dev, shared_page, &ring->blk_ring);
-	if (err < 0)
+	if (err < 0) {
+		printk(KERN_CRIT "XEN blkif map\n");
 		return err;
+	}
 
 	switch (blkif->blk_protocol) {
 	case BLKIF_PROTOCOL_NATIVE:
@@ -251,6 +265,7 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 		struct blkif_x86_64_sring *sring_x86_64;
 		sring_x86_64 = (struct blkif_x86_64_sring *)ring->blk_ring;
 		BACK_RING_INIT(&ring->blk_rings.x86_64, sring_x86_64, PAGE_SIZE);
+		printk(KERN_CRIT "XEN blk ring init\n");
 		break;
 	}
 	default:
@@ -261,6 +276,7 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 						    xen_blkif_be_int, 0,
 						    "blkif-backend", blkif);
 	if (err < 0) {
+		printk(KERN_CRIT "XEN evtchn err\n");
 		xenbus_unmap_ring_vfree(blkif->be->dev, ring->blk_ring);
 		ring->blk_rings.common.sring = NULL;
 		return err;
@@ -480,15 +496,22 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 
 	if (q && q->mq_ops)
 		vbd->nr_supported_hw_queues = q->nr_hw_queues;
+	printk(KERN_CRIT "XEN nr_supported_hw_queues %d\n", vbd->nr_supported_hw_queues);
+	/* XXX forcing to 1 */
+	vbd->nr_supported_hw_queues = 1;
 
-	if (vbd->nr_supported_hw_queues > 1)
-		if (!xen_blkif_ring_alloc(blkif, vbd->nr_supported_hw_queues))
+	if (vbd->nr_supported_hw_queues > 1) {
+		blkif->ring = xen_blkif_ring_alloc(blkif,
+			vbd->nr_supported_hw_queues);
+		if (!blkif->ring)
 			return -ENOMEM;
+	}
 
 	DPRINTK("Successful creation of handle=%04x (dom=%u)\n",
 		handle, blkif->domid);
 	return 0;
 }
+
 static int xen_blkbk_remove(struct xenbus_device *dev)
 {
 	struct backend_info *be = dev_get_drvdata(&dev->dev);
@@ -731,6 +754,7 @@ static void frontend_changed(struct xenbus_device *dev,
 	int err;
 
 	DPRINTK("%s", xenbus_strstate(frontend_state));
+	printk(KERN_CRIT "XEN frontend_changed %d\n", frontend_state);
 
 	switch (frontend_state) {
 	case XenbusStateInitialising:
@@ -891,6 +915,7 @@ static int connect_ring(struct backend_info *be)
 	char protocol[64] = "";
 	int err;
 
+	printk(KERN_CRIT "XEN connect_ring\n");
 	DPRINTK("%s", dev->otherend);
 
 	err = xenbus_gather(XBT_NIL, dev->otherend, "ring-ref", "%lu",
@@ -901,6 +926,7 @@ static int connect_ring(struct backend_info *be)
 				 dev->otherend);
 		return err;
 	}
+	printk(KERN_CRIT "XEN connect_ring 2\n");
 
 	be->blkif->blk_protocol = BLKIF_PROTOCOL_NATIVE;
 	err = xenbus_gather(XBT_NIL, dev->otherend, "protocol",
@@ -917,6 +943,7 @@ static int connect_ring(struct backend_info *be)
 		xenbus_dev_fatal(dev, err, "unknown fe protocol %s", protocol);
 		return -1;
 	}
+	printk(KERN_CRIT "XEN connect_ring 3\n");
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "feature-persistent", "%u",
 			    &pers_grants, NULL);
