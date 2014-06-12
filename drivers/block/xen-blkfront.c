@@ -2050,9 +2050,12 @@ static void blkfront_connect(struct blkfront_info *info)
 			    NULL);
 	if (err)
 		info->nr_hw_queues = 0;
-	else
-		info->nr_hw_queues = nr_queues;
-	if (info->nr_hw_queues > 1) {
+	else {
+		printk(KERN_CRIT "XEN nr_supported_hw_queues %d\n", info->nr_hw_queues);
+		info->nr_hw_queues = 1; // nr_queues
+	}
+
+	if (info->nr_hw_queues > 0) { // supports multiqueue
 		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
 		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
 					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
