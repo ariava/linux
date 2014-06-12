@@ -66,11 +66,11 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 {
 	int err;
 	char name[TASK_COMM_LEN];
-	/* XXX */
-	struct xen_blkif_ring *ring = &blkif->ring[0];
+	/* XXX accessing always ring 0 for now */
+	struct xen_blkif_ring *ring = blkif->ring;
 
 	/* Not ready to connect? */
-	if (!ring->irq || !blkif->vbd.bdev)
+	if (!ring || !ring->irq || !blkif->vbd.bdev)
 		return;
 
 	/* Already connected? */
