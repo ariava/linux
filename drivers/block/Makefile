@@ -42,6 +42,7 @@ obj-$(CONFIG_BLK_DEV_PCIESSD_MTIP32XX)	+= mtip32xx/
 
 obj-$(CONFIG_BLK_DEV_RSXX) += rsxx/
 obj-$(CONFIG_BLK_DEV_NULL_BLK)	+= null_blk.o
+obj-$(CONFIG_BLK_DEV_FAKE_MQ_BLK)	+= fake_mq_blk.o
 obj-$(CONFIG_ZRAM) += zram/
 
 nvme-y		:= nvme-core.o nvme-scsi.o
