@@ -278,7 +278,7 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 
 	err = bind_interdomain_evtchn_to_irqhandler(blkif->domid, evtchn,
 						    xen_blkif_be_int, 0,
-						    "blkif-backend", blkif);
+						    "blkif-backend", ring);
 	if (err < 0) {
 		printk(KERN_CRIT "XEN evtchn err\n");
 		xenbus_unmap_ring_vfree(blkif->be->dev, ring->blk_ring);
