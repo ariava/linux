@@ -320,7 +320,7 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 static void xen_blkif_free(struct xen_blkif *blkif)
 {
 	struct pending_req *req, *n;
-	int i = 0, j;
+	int i, j, r;
 
 	if (!atomic_dec_and_test(&blkif->refcnt))
 		BUG();
@@ -336,8 +336,9 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 	BUG_ON(!list_empty(&blkif->free_pages));
 	BUG_ON(!RB_EMPTY_ROOT(&blkif->persistent_gnts));
 
-	for (i = 0 ; i < blkif->vbd.nr_supported_hw_queues ; i++) {
-		struct xen_blkif_ring *ring = &blkif->ring[i];
+	for (r = 0 ; r < blkif->allocated_rings ; r++) {
+		struct xen_blkif_ring *ring = &blkif->ring[r];
+		i = 0;
 		/* Check that there is no request in use */
 		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
 			list_del(&req->free_list);
@@ -351,9 +352,8 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 			kfree(req);
 			i++;
 		}
+		WARN_ON(i != XEN_BLKIF_REQS);
 	}
-
-	WARN_ON(i != XEN_BLKIF_REQS);
 
 	kfree(blkif->ring);
 
