@@ -119,6 +119,10 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 
 	rings = krealloc(blkif->ring, nr_rings * sizeof(struct xen_blkif_ring),
 			 GFP_KERNEL);
+	memset(rings + sizeof(struct xen_blkif_ring) * blkif->allocated_rings,
+	       0, (nr_rings - blkif->allocated_rings) *
+		  sizeof(struct xen_blkif_ring));
+	printk(KERN_CRIT "XEN blkif_ring_alloc offs %d, nr %d", blkif->allocated_rings, nr_rings - blkif->allocated_rings);
 
 	if (!rings)
 		return NULL;
