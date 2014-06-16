@@ -24,6 +24,11 @@ static int hw_queue_depth = 64;
 module_param(hw_queue_depth, int, S_IRUGO);
 MODULE_PARM_DESC(hw_queue_depth, "Queue depth for each hardware queue. Default: 64");
 
+struct fake_mq_cmd {
+        struct request *rq;
+        char *backend;
+};
+
 struct fake_mq {
 	struct request_queue *q;
 	struct gendisk *disk;
@@ -39,15 +44,22 @@ struct fake_mq *fake_mq_dev;
 
 /* No lock because each hctx accesses to separate data */
 static void fake_mq_transfer(char *buffer, int write,
+			     unsigned long nbytes,
 			     struct blk_mq_hw_ctx *hctx)
 {
 	if (!write)
-		memcpy(buffer, hctx->driver_data, 1);
+		memset(buffer, *(char *)hctx->driver_data, nbytes);
 }
 
 static int fake_mq_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
 {
-	fake_mq_transfer(rq->buffer, rq_data_dir(rq), hctx);
+	struct fake_mq_cmd *cmd = rq->special;
+
+	cmd->rq = rq;
+	cmd->backend = hctx->driver_data;
+
+	fake_mq_transfer(rq->buffer, rq_data_dir(rq), blk_rq_bytes(rq),
+			 hctx);
 	blk_mq_complete_request(rq);
 
 	return BLK_MQ_RQ_QUEUE_OK;
@@ -63,15 +75,22 @@ static int fake_mq_init_hctx(struct blk_mq_hw_ctx *hctx, void *driver_data,
 	return 0;
 }
 
+static void fake_mq_softirq_done(struct request *rq)
+{
+	blk_mq_end_io(rq, 0);
+}
+
 static struct blk_mq_ops fake_mq_ops = {
 	.queue_rq       = fake_mq_queue_rq,
 	.map_queue      = blk_mq_map_queue,
 	.init_hctx	= fake_mq_init_hctx,
+	.complete	= fake_mq_softirq_done,
 };
 
 static struct blk_mq_reg fake_mq_reg = {
 	.ops		= &fake_mq_ops,
 	.queue_depth	= 64,
+	.cmd_size	= sizeof(struct fake_mq_cmd),
 	.flags		= BLK_MQ_F_SHOULD_MERGE,
 };
 
