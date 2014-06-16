@@ -70,7 +70,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	struct xen_blkif_ring *ring = blkif->ring;
 
 	/* Not ready to connect? */
-	if (!ring || !ring->irq || !blkif->vbd.bdev)
+	if (!ring->irq || !blkif->vbd.bdev)
 		return;
 
 	/* Already connected? */
@@ -122,17 +122,13 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	memset(rings + sizeof(struct xen_blkif_ring) * blkif->allocated_rings,
 	       0, (nr_rings - blkif->allocated_rings) *
 		  sizeof(struct xen_blkif_ring));
-	printk(KERN_CRIT "XEN blkif_ring_alloc offs %d, nr %d", blkif->allocated_rings, nr_rings - blkif->allocated_rings);
 
 	if (!rings)
 		return NULL;
 
-	printk(KERN_CRIT "XEN allocated %d rings at %p\n", nr_rings, rings);
-
 	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
 
-		printk(KERN_CRIT "XEN working on alloc ring %d\n", r);
 		init_waitqueue_head(&ring->wq);
 		init_waitqueue_head(&ring->waiting_to_free);
 		init_waitqueue_head(&ring->shutdown_wq);
@@ -235,19 +231,13 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 	struct xen_blkif *blkif;
 
 	/* Already connected through? */
-	if (!ring || ring->irq) {
-		printk(KERN_CRIT "XEN blkif map blkif not connected\n");
+	if (ring->irq)
 		return 0;
-	}
-	printk(KERN_CRIT "XEN blkif map blkif connected\n");
-
 	blkif = ring->blkif;
 
-	err = xenbus_map_ring_valloc(ring->blkif->be->dev, shared_page, &ring->blk_ring);
-	if (err < 0) {
-		printk(KERN_CRIT "XEN blkif map\n");
+	err = xenbus_map_ring_valloc(blkif->be->dev, shared_page, &ring->blk_ring);
+	if (err < 0)
 		return err;
-	}
 
 	switch (blkif->blk_protocol) {
 	case BLKIF_PROTOCOL_NATIVE:
@@ -269,7 +259,6 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 		struct blkif_x86_64_sring *sring_x86_64;
 		sring_x86_64 = (struct blkif_x86_64_sring *)ring->blk_ring;
 		BACK_RING_INIT(&ring->blk_rings.x86_64, sring_x86_64, PAGE_SIZE);
-		printk(KERN_CRIT "XEN blk ring init\n");
 		break;
 	}
 	default:
@@ -280,7 +269,6 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 						    xen_blkif_be_int, 0,
 						    "blkif-backend", ring);
 	if (err < 0) {
-		printk(KERN_CRIT "XEN evtchn err\n");
 		xenbus_unmap_ring_vfree(blkif->be->dev, ring->blk_ring);
 		ring->blk_rings.common.sring = NULL;
 		return err;
@@ -294,7 +282,7 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 {
 	int i;
 
-	for (i = 0 ; i < blkif->vbd.nr_supported_hw_queues ; i++) {
+	for (i = 0 ; i < blkif->allocated_rings ; i++) {
 		struct xen_blkif_ring *ring = &blkif->ring[i];
 		if (ring->xenblkd) {
 			kthread_stop(ring->xenblkd);
@@ -500,7 +488,6 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 
 	if (q && q->mq_ops)
 		vbd->nr_supported_hw_queues = q->nr_hw_queues;
-	printk(KERN_CRIT "XEN nr_supported_hw_queues %d\n", vbd->nr_supported_hw_queues);
 	/* XXX forcing to 1 */
 	vbd->nr_supported_hw_queues = 1;
 
@@ -758,7 +745,6 @@ static void frontend_changed(struct xenbus_device *dev,
 	int err;
 
 	DPRINTK("%s", xenbus_strstate(frontend_state));
-	printk(KERN_CRIT "XEN frontend_changed %d\n", frontend_state);
 
 	switch (frontend_state) {
 	case XenbusStateInitialising:
@@ -919,7 +905,6 @@ static int connect_ring(struct backend_info *be)
 	char protocol[64] = "";
 	int err;
 
-	printk(KERN_CRIT "XEN connect_ring\n");
 	DPRINTK("%s", dev->otherend);
 
 	err = xenbus_gather(XBT_NIL, dev->otherend, "ring-ref", "%lu",
@@ -930,7 +915,6 @@ static int connect_ring(struct backend_info *be)
 				 dev->otherend);
 		return err;
 	}
-	printk(KERN_CRIT "XEN connect_ring 2\n");
 
 	be->blkif->blk_protocol = BLKIF_PROTOCOL_NATIVE;
 	err = xenbus_gather(XBT_NIL, dev->otherend, "protocol",
@@ -947,7 +931,6 @@ static int connect_ring(struct backend_info *be)
 		xenbus_dev_fatal(dev, err, "unknown fe protocol %s", protocol);
 		return -1;
 	}
-	printk(KERN_CRIT "XEN connect_ring 3\n");
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "feature-persistent", "%u",
 			    &pers_grants, NULL);
