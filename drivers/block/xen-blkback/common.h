@@ -279,6 +279,7 @@ struct xen_blkif_ring {
 	wait_queue_head_t	pending_free_wq;
 
 	struct xen_blkif	*blkif;
+	unsigned		ring_index;
 };
 
 struct xen_blkif {

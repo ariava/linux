@@ -155,6 +155,7 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 		}
 		spin_lock_init(&ring->pending_free_lock);
 		ring->blkif = blkif;
+		ring->ring_index = r;
 	}
 
 	blkif->allocated_rings = nr_rings;
