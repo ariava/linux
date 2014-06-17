@@ -64,13 +64,15 @@ static int blkback_name(struct xen_blkif *blkif, char *buf)
 
 static void xen_update_blkif_status(struct xen_blkif *blkif)
 {
-	int err;
-	char name[TASK_COMM_LEN];
-	/* XXX accessing always ring 0 for now */
-	struct xen_blkif_ring *ring = &blkif->rings[0];
+	int i, err;
+	char name[TASK_COMM_LEN], per_ring_name[TASK_COMM_LEN];
+	struct xen_blkif_ring *ring;
 
-	/* Not ready to connect? */
-	if (!ring->irq || !blkif->vbd.bdev)
+	/*
+	 * Not ready to connect? Check irq of first ring as the others
+	 * should all be the same.
+	 */
+	if (!blkif->rings[0].irq || !blkif->vbd.bdev)
 		return;
 
 	/* Already connected? */
@@ -95,15 +97,16 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	}
 	invalidate_inode_pages2(blkif->vbd.bdev->bd_inode->i_mapping);
 
-	/* XXX change name and run in a for loop when going to multi-queue */
-	BUG_ON(blkif->vbd.nr_supported_hw_queues > 1);
-
-	ring->xenblkd = kthread_run(xen_blkif_schedule, ring, "%s", name);
-	if (IS_ERR(ring->xenblkd)) {
-		err = PTR_ERR(ring->xenblkd);
-		ring->xenblkd = NULL;
-		xenbus_dev_error(blkif->be->dev, err, "start xenblkd");
-		return;
+	for (i = 0 ; i < blkif->allocated_rings ; i++) {
+		ring = &blkif->rings[i];
+		snprintf(per_ring_name, TASK_COMM_LEN, "%s-%d", name, i);
+		ring->xenblkd = kthread_run(xen_blkif_schedule, ring, "%s", per_ring_name);
+		if (IS_ERR(ring->xenblkd)) {
+			err = PTR_ERR(ring->xenblkd);
+			ring->xenblkd = NULL;
+			xenbus_dev_error(blkif->be->dev, err, "start xenblkd");
+			return;
+		}
 	}
 }
 
@@ -900,21 +903,41 @@ again:
 static int connect_ring(struct backend_info *be)
 {
 	struct xenbus_device *dev = be->dev;
-	unsigned long ring_ref;
-	unsigned int evtchn;
+	struct xen_blkif *blkif = be->blkif;
+	unsigned long *ring_ref;
+	unsigned int *evtchn;
 	unsigned int pers_grants;
-	char protocol[64] = "";
-	int err;
+	char protocol[64] = "", ring_ref_s[64] = "", evtchn_s[64] = "";
+	int i, err;
 
 	DPRINTK("%s", dev->otherend);
 
-	err = xenbus_gather(XBT_NIL, dev->otherend, "ring-ref", "%lu",
-			    &ring_ref, "event-channel", "%u", &evtchn, NULL);
-	if (err) {
-		xenbus_dev_fatal(dev, err,
-				 "reading %s/ring-ref and event-channel",
-				 dev->otherend);
-		return err;
+	/* We should already have the number of supported hw queues */
+	BUG_ON(blkif->vbd.nr_supported_hw_queues != blkif->allocated_rings);
+	ring_ref = kzalloc(sizeof(unsigned long) * blkif->allocated_rings,
+			   GFP_KERNEL);
+	if (!ring_ref)
+		return -ENOMEM;
+	evtchn = kzalloc(sizeof(unsigned int) * blkif->allocated_rings,
+			 GFP_KERNEL);
+	if (!evtchn) {
+		kfree(ring_ref);
+		return -ENOMEM;
+	}
+
+	/* XXX support old xenstore keys if not multiqueue */
+	for (i = 0 ; i < blkif->allocated_rings ; i++) {
+		snprintf(ring_ref_s, 64, "ring-ref-%d", i);
+		snprintf(evtchn_s, 64, "event-channel-%d", i);
+		err = xenbus_gather(XBT_NIL, dev->otherend,
+				    ring_ref_s, "%lu", &ring_ref[i],
+				    evtchn_s, "%u", &evtchn[i], NULL);
+		if (err) {
+			xenbus_dev_fatal(dev, err,
+					 "reading %s/%s and event-channel",
+					 dev->otherend, ring_ref_s);
+			goto fail;
+		}
 	}
 
 	be->blkif->blk_protocol = BLKIF_PROTOCOL_NATIVE;
@@ -930,7 +953,8 @@ static int connect_ring(struct backend_info *be)
 		be->blkif->blk_protocol = BLKIF_PROTOCOL_X86_64;
 	else {
 		xenbus_dev_fatal(dev, err, "unknown fe protocol %s", protocol);
-		return -1;
+		err = -1;
+		goto fail;
 	}
 	err = xenbus_gather(XBT_NIL, dev->otherend,
 			    "feature-persistent", "%u",
@@ -941,21 +965,26 @@ static int connect_ring(struct backend_info *be)
 	be->blkif->vbd.feature_gnt_persistent = pers_grants;
 	be->blkif->vbd.overflow_max_grants = 0;
 
-	pr_info(DRV_PFX "ring-ref %ld, event-channel %d, protocol %d (%s) %s\n",
-		ring_ref, evtchn, be->blkif->blk_protocol, protocol,
-		pers_grants ? "persistent grants" : "");
+	for (i = 0; i < blkif->allocated_rings ; i++) {
+		pr_info(DRV_PFX "ring-ref %ld, event-channel %d, protocol %d (%s) %s\n",
+			ring_ref[i], evtchn[i], be->blkif->blk_protocol, protocol,
+			pers_grants ? "persistent grants" : "");
 
-	/* XXX gather appropriate names from frontend as soon as switching to > 1 */
-
-	/* Map the shared frame, irq etc. */
-	err = xen_blkif_map(&be->blkif->rings[0], ring_ref, evtchn);
-	if (err) {
-		xenbus_dev_fatal(dev, err, "mapping ring-ref %lu port %u",
-				 ring_ref, evtchn);
-		return err;
+		/* Map the shared frame, irq etc. */
+		err = xen_blkif_map(&be->blkif->rings[i], ring_ref[i], evtchn[i]);
+		if (err) {
+			xenbus_dev_fatal(dev, err, "mapping ring-ref %lu port %u of ring %d",
+					 ring_ref[i], evtchn[i], i);
+			goto fail;
+		}
 	}
 
 	return 0;
+
+fail:
+	kfree(ring_ref);
+	kfree(evtchn);
+	return err;
 }
 
 
