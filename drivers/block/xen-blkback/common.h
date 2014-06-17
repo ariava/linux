@@ -291,7 +291,7 @@ struct xen_blkif {
 	/* The VBD attached to this interface. */
 	struct xen_vbd		vbd;
 	/* Rings for this device */
-	struct xen_blkif_ring	*ring;
+	struct xen_blkif_ring	*rings;
 	unsigned int		allocated_rings;
 	/* Back pointer to the backend_info. */
 	struct backend_info	*be;

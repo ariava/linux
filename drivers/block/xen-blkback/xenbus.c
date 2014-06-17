@@ -67,7 +67,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	int err;
 	char name[TASK_COMM_LEN];
 	/* XXX accessing always ring 0 for now */
-	struct xen_blkif_ring *ring = blkif->ring;
+	struct xen_blkif_ring *ring = &blkif->rings[0];
 
 	/* Not ready to connect? */
 	if (!ring->irq || !blkif->vbd.bdev)
@@ -115,9 +115,9 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	struct xen_blkif_ring *rings;
 
 	if (nr_rings == blkif->allocated_rings)
-		return blkif->ring;
+		return blkif->rings;
 
-	rings = krealloc(blkif->ring, nr_rings * sizeof(struct xen_blkif_ring),
+	rings = krealloc(blkif->rings, nr_rings * sizeof(struct xen_blkif_ring),
 			 GFP_KERNEL);
 	memset(rings + sizeof(struct xen_blkif_ring) * blkif->allocated_rings,
 	       0, (nr_rings - blkif->allocated_rings) *
@@ -198,8 +198,8 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	 * Allocate a dummy ring, since we still don't know how many hardware
 	 * queues we have.
 	 */
-	blkif->ring = xen_blkif_ring_alloc(blkif, 1);
-	if (!blkif->ring)
+	blkif->rings = xen_blkif_ring_alloc(blkif, 1);
+	if (!blkif->rings)
 		goto fail;
 
 	blkif->domid = domid;
@@ -284,7 +284,7 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 	int i;
 
 	for (i = 0 ; i < blkif->allocated_rings ; i++) {
-		struct xen_blkif_ring *ring = &blkif->ring[i];
+		struct xen_blkif_ring *ring = &blkif->rings[i];
 		if (ring->xenblkd) {
 			kthread_stop(ring->xenblkd);
 			wake_up(&ring->shutdown_wq);
@@ -326,7 +326,7 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 	BUG_ON(!RB_EMPTY_ROOT(&blkif->persistent_gnts));
 
 	for (r = 0 ; r < blkif->allocated_rings ; r++) {
-		struct xen_blkif_ring *ring = &blkif->ring[r];
+		struct xen_blkif_ring *ring = &blkif->rings[r];
 		i = 0;
 		/* Check that there is no request in use */
 		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
@@ -344,7 +344,7 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 		WARN_ON(i != XEN_BLKIF_REQS);
 	}
 
-	kfree(blkif->ring);
+	kfree(blkif->rings);
 
 	kmem_cache_free(xen_blkif_cachep, blkif);
 }
@@ -493,9 +493,9 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	vbd->nr_supported_hw_queues = 1;
 
 	if (vbd->nr_supported_hw_queues > 1) {
-		blkif->ring = xen_blkif_ring_alloc(blkif,
+		blkif->rings = xen_blkif_ring_alloc(blkif,
 			vbd->nr_supported_hw_queues);
-		if (!blkif->ring)
+		if (!blkif->rings)
 			return -ENOMEM;
 	}
 
@@ -948,7 +948,7 @@ static int connect_ring(struct backend_info *be)
 	/* XXX gather appropriate names from frontend as soon as switching to > 1 */
 
 	/* Map the shared frame, irq etc. */
-	err = xen_blkif_map(&be->blkif->ring[0], ring_ref, evtchn);
+	err = xen_blkif_map(&be->blkif->rings[0], ring_ref, evtchn);
 	if (err) {
 		xenbus_dev_fatal(dev, err, "mapping ring-ref %lu port %u",
 				 ring_ref, evtchn);
