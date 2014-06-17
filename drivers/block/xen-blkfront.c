@@ -1407,6 +1407,7 @@ static int talk_to_blkback(struct xenbus_device *dev,
 			   struct blkfront_info *info)
 {
 	const char *message = NULL;
+	char ring_ref_s[64] = "", evtchn_s[64] = "";
 	struct xenbus_transaction xbt;
 	int i, err;
 
@@ -1417,12 +1418,6 @@ static int talk_to_blkback(struct xenbus_device *dev,
 			goto out;
 	}
 
-	/*
-	 * XXX generate keys if blkback supports multiqueue
-	 *
-	 * The following BUG_ON is to remind me to change this.
-	 */
-	BUG_ON(info->nr_rings != 1);
 again:
 	err = xenbus_transaction_start(&xbt);
 	if (err) {
@@ -1430,18 +1425,24 @@ again:
 		goto destroy_blkring;
 	}
 
-	err = xenbus_printf(xbt, dev->nodename,
-			    "ring-ref", "%u", info->rinfo[0].ring_ref);
-	if (err) {
-		message = "writing ring-ref";
-		goto abort_transaction;
+	/* XXX support old xenstore keys if not multiqueue */
+	for (i = 0 ; i < info->nr_rings ; i++) {
+		snprintf(ring_ref_s, 64, "ring-ref-%d", i);
+		snprintf(evtchn_s, 64, "event-channel-%d", i);
+		err = xenbus_printf(xbt, dev->nodename,
+				    ring_ref_s, "%u", info->rinfo[i].ring_ref);
+		if (err) {
+			message = "writing ring-ref";
+			goto abort_transaction;
+		}
+		err = xenbus_printf(xbt, dev->nodename,
+				    evtchn_s, "%u", info->rinfo[i].evtchn);
+		if (err) {
+			message = "writing event-channel";
+			goto abort_transaction;
+		}
 	}
-	err = xenbus_printf(xbt, dev->nodename,
-			    "event-channel", "%u", info->rinfo[0].evtchn);
-	if (err) {
-		message = "writing event-channel";
-		goto abort_transaction;
-	}
+
 	err = xenbus_printf(xbt, dev->nodename, "protocol", "%s",
 			    XEN_IO_PROTO_ABI_NATIVE);
 	if (err) {
