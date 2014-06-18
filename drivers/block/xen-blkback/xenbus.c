@@ -492,8 +492,6 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 
 	if (q && q->mq_ops)
 		vbd->nr_supported_hw_queues = q->nr_hw_queues;
-	/* XXX forcing to 1 */
-	vbd->nr_supported_hw_queues = 1;
 
 	if (vbd->nr_supported_hw_queues > 1) {
 		blkif->rings = xen_blkif_ring_alloc(blkif,
@@ -913,7 +911,9 @@ static int connect_ring(struct backend_info *be)
 	DPRINTK("%s", dev->otherend);
 
 	/* We should already have the number of supported hw queues */
-	BUG_ON(blkif->vbd.nr_supported_hw_queues != blkif->allocated_rings);
+	BUG_ON(blkif->vbd.nr_supported_hw_queues ?
+	       blkif->vbd.nr_supported_hw_queues != blkif->allocated_rings :
+	       blkif->allocated_rings != 1);
 	ring_ref = kzalloc(sizeof(unsigned long) * blkif->allocated_rings,
 			   GFP_KERNEL);
 	if (!ring_ref)
@@ -925,10 +925,16 @@ static int connect_ring(struct backend_info *be)
 		return -ENOMEM;
 	}
 
-	/* XXX support old xenstore keys if not multiqueue */
 	for (i = 0 ; i < blkif->allocated_rings ; i++) {
-		snprintf(ring_ref_s, 64, "ring-ref-%d", i);
-		snprintf(evtchn_s, 64, "event-channel-%d", i);
+		if (blkif->vbd.nr_supported_hw_queues == 0) {
+			BUG_ON(i != 0);
+			/* Support old XenStore keys for compatibility */
+			snprintf(ring_ref_s, 64, "ring-ref");
+			snprintf(evtchn_s, 64, "event-channel");
+		} else {
+			snprintf(ring_ref_s, 64, "ring-ref-%d", i);
+			snprintf(evtchn_s, 64, "event-channel-%d", i);
+		}
 		err = xenbus_gather(XBT_NIL, dev->otherend,
 				    ring_ref_s, "%lu", &ring_ref[i],
 				    evtchn_s, "%u", &evtchn[i], NULL);
