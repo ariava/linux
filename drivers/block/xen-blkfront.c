@@ -1425,10 +1425,16 @@ again:
 		goto destroy_blkring;
 	}
 
-	/* XXX support old xenstore keys if not multiqueue */
 	for (i = 0 ; i < info->nr_rings ; i++) {
-		snprintf(ring_ref_s, 64, "ring-ref-%d", i);
-		snprintf(evtchn_s, 64, "event-channel-%d", i);
+		if (info->nr_hw_queues == 0) {
+			BUG_ON(i > 0);
+			/* Support old XenStore keys */
+			snprintf(ring_ref_s, 64, "ring-ref");
+			snprintf(evtchn_s, 64, "event-channel");
+		} else {
+			snprintf(ring_ref_s, 64, "ring-ref-%d", i);
+			snprintf(evtchn_s, 64, "event-channel-%d", i);
+		}
 		err = xenbus_printf(xbt, dev->nodename,
 				    ring_ref_s, "%u", info->rinfo[i].ring_ref);
 		if (err) {
@@ -2051,10 +2057,8 @@ static void blkfront_connect(struct blkfront_info *info)
 			    NULL);
 	if (err)
 		info->nr_hw_queues = 0;
-	else {
-		printk(KERN_CRIT "XEN nr_supported_hw_queues %d\n", info->nr_hw_queues);
-		info->nr_hw_queues = 1; // nr_queues
-	}
+	else
+		info->nr_hw_queues = nr_queues;
 
 	if (info->nr_hw_queues > 0) { // supports multiqueue
 		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
@@ -2069,7 +2073,7 @@ static void blkfront_connect(struct blkfront_info *info)
 	 * At last, the backend has told us the number of hw queues he wants.
 	 * If it is > 1, allocate the correct number of rings.
 	 */
-	info->nr_rings = blkfront_mq_reg.nr_hw_queues;
+	info->nr_rings = info->nr_hw_queues ? : 1;
 	if (info->nr_rings > 1)
 		info->rinfo = krealloc(info->rinfo,
 				       info->nr_rings *
