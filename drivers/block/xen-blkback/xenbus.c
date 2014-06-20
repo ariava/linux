@@ -950,6 +950,7 @@ static int connect_ring(struct backend_info *be)
 			xenbus_dev_fatal(dev, err,
 					 "reading %s/%s and event-channel",
 					 dev->otherend, ring_ref_s);
+			/* XXX distinguish between mq-capable and non-mq-capable */
 			goto fail;
 		}
 	}
