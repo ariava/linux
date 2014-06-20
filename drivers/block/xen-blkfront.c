@@ -1492,8 +1492,9 @@ again:
 static int blkfront_probe(struct xenbus_device *dev,
 			  const struct xenbus_device_id *id)
 {
-	int err, vdevice, i;
+	int err, vdevice, i, r;
 	struct blkfront_info *info;
+	unsigned int nr_queues;
 
 	/* FIXME: Use dynamic device id if this is not set. */
 	err = xenbus_scanf(XBT_NIL, dev->nodename,
@@ -1553,17 +1554,42 @@ static int blkfront_probe(struct xenbus_device *dev,
 	info->connected = BLKIF_STATE_DISCONNECTED;
 	INIT_WORK(&info->work, blkif_restart_queue);
 
-	/* We don't know how many rings the backend supports: allocate one */
-	info->nr_rings = 1;
-	info->rinfo = kzalloc(sizeof(struct blkfront_ring_info), GFP_KERNEL);
-	info->rinfo[0].info = info;
-	for (i = 0; i < BLK_RING_SIZE; i++)
-		info->rinfo[0].shadow[i].req.u.rw.id = i+1;
-	info->rinfo[0].shadow[BLK_RING_SIZE-1].req.u.rw.id = 0x0fffffff;
 
 	/* Front end dir is a number, which is used as the id. */
 	info->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
 	dev_set_drvdata(&dev->dev, info);
+
+	/* Gather the number of hardware queues as soon as possible */
+	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
+			    "nr_supported_hw_queues", "%u", &nr_queues,
+			    NULL);
+	if (err)
+		info->nr_hw_queues = 0;
+	else
+		info->nr_hw_queues = nr_queues;
+	printk(KERN_CRIT "XEN blkfront_probe nr_hw_queues %u\n", info->nr_hw_queues);
+	if (info->nr_hw_queues > 0) { /* supports multiqueue */
+		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
+		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
+					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
+					      BLK_RING_SIZE;
+		blkfront_mq_reg.cmd_size = max(sizeof(struct blkif_request),
+					sizeof(struct blkif_x86_64_request));
+	}
+	/*
+	 * The backend has told us the number of hw queues he wants.
+	 * Allocate the correct number of rings.
+	 */
+	info->nr_rings = info->nr_hw_queues ? : 1;
+	printk(KERN_CRIT "XEN blkfront_probe %d\n", info->nr_rings);
+	info->rinfo = kzalloc(info->nr_rings * sizeof(struct blkfront_ring_info),
+			      GFP_KERNEL);
+	for (r = 0 ; r < info->nr_rings ; r++) {
+		info->rinfo[r].info = info;
+		for (i = 0; i < BLK_RING_SIZE; i++)
+			info->rinfo[r].shadow[i].req.u.rw.id = i+1;
+		info->rinfo[r].shadow[BLK_RING_SIZE-1].req.u.rw.id = 0x0fffffff;
+	}
 
 	err = talk_to_blkback(dev, info);
 	if (err) {
@@ -1947,7 +1973,6 @@ static void blkfront_connect(struct blkfront_info *info)
 	unsigned int physical_sector_size;
 	unsigned int binfo;
 	unsigned int segs;
-	unsigned int nr_queues;
 	int i, err;
 	int barrier, flush, discard, persistent;
 
@@ -2052,37 +2077,8 @@ static void blkfront_connect(struct blkfront_info *info)
 	else
 		info->feature_persistent = persistent;
 
-	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
-			    "nr_supported_hw_queues", "%u", &nr_queues,
-			    NULL);
-	if (err)
-		info->nr_hw_queues = 0;
-	else
-		info->nr_hw_queues = nr_queues;
-
-	if (info->nr_hw_queues > 0) { // supports multiqueue
-		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
-		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
-					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
-					      BLK_RING_SIZE;
-		blkfront_mq_reg.cmd_size = max(sizeof(struct blkif_request),
-					sizeof(struct blkif_x86_64_request));
-	}
-
-	/*
-	 * At last, the backend has told us the number of hw queues he wants.
-	 * If it is > 1, allocate the correct number of rings.
-	 */
-	info->nr_rings = info->nr_hw_queues ? : 1;
-	if (info->nr_rings > 1)
-		info->rinfo = krealloc(info->rinfo,
-				       info->nr_rings *
-					sizeof(struct blkfront_ring_info),
-				       GFP_KERNEL);
-
 	segs = blkfront_gather_indirect(info);
 	for (i = 0 ; i < info->nr_rings ; i++) {
-		info->rinfo[i].info = info;
 		err = blkfront_setup_indirect(&info->rinfo[i], segs);
 		if (err) {
 			xenbus_dev_fatal(info->xbdev, err, "setup_indirect at %s",
