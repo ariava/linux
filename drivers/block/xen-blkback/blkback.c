@@ -428,18 +428,18 @@ finished:
 /*
  * Retrieve from the 'pending_reqs' a free pending_req structure to be used.
  */
-static struct pending_req *alloc_req(struct xen_blkif_ring *ring)
+static struct pending_req *alloc_req(struct xen_blkif *blkif)
 {
 	struct pending_req *req = NULL;
 	unsigned long flags;
 
-	spin_lock_irqsave(&ring->pending_free_lock, flags);
-	if (!list_empty(&ring->pending_free)) {
-		req = list_entry(ring->pending_free.next, struct pending_req,
+	spin_lock_irqsave(&blkif->pending_free_lock, flags);
+	if (!list_empty(&blkif->pending_free)) {
+		req = list_entry(blkif->pending_free.next, struct pending_req,
 				 free_list);
 		list_del(&req->free_list);
 	}
-	spin_unlock_irqrestore(&ring->pending_free_lock, flags);
+	spin_unlock_irqrestore(&blkif->pending_free_lock, flags);
 	return req;
 }
 
@@ -447,17 +447,17 @@ static struct pending_req *alloc_req(struct xen_blkif_ring *ring)
  * Return the 'pending_req' structure back to the freepool. We also
  * wake up the thread if it was waiting for a free page.
  */
-static void free_req(struct xen_blkif_ring *ring, struct pending_req *req)
+static void free_req(struct xen_blkif *blkif, struct pending_req *req)
 {
 	unsigned long flags;
 	int was_empty;
 
-	spin_lock_irqsave(&ring->pending_free_lock, flags);
-	was_empty = list_empty(&ring->pending_free);
-	list_add(&req->free_list, &ring->pending_free);
-	spin_unlock_irqrestore(&ring->pending_free_lock, flags);
+	spin_lock_irqsave(&blkif->pending_free_lock, flags);
+	was_empty = list_empty(&blkif->pending_free);
+	list_add(&req->free_list, &blkif->pending_free);
+	spin_unlock_irqrestore(&blkif->pending_free_lock, flags);
 	if (was_empty)
-		wake_up(&ring->pending_free_wq);
+		wake_up(&blkif->pending_free_wq);
 }
 
 /*
@@ -594,8 +594,8 @@ int xen_blkif_schedule(void *arg)
 		if (timeout == 0)
 			goto purge_gnt_list;
 		timeout = wait_event_interruptible_timeout(
-			ring->pending_free_wq,
-			!list_empty(&ring->pending_free) ||
+			blkif->pending_free_wq,
+			!list_empty(&blkif->pending_free) ||
 			kthread_should_stop(),
 			timeout);
 		if (timeout == 0)
@@ -935,7 +935,7 @@ static int dispatch_other_io(struct xen_blkif_ring *ring,
 			     struct blkif_request *req,
 			     struct pending_req *pending_req)
 {
-	free_req(ring, pending_req);
+	free_req(ring->blkif, pending_req);
 	make_response(ring, req->u.other.id, req->operation,
 		      BLKIF_RSP_EOPNOTSUPP);
 	return -EIO;
@@ -993,7 +993,7 @@ static void __end_block_io_op(struct pending_req *pending_req, int error)
 		                pending_req->nr_pages);
 		make_response(ring, pending_req->id,
 			      pending_req->operation, pending_req->status);
-		free_req(ring, pending_req);
+		free_req(blkif, pending_req);
 		/*
 		 * Make sure the request is freed before releasing blkif,
 		 * or there could be a race between free_req and the
@@ -1059,7 +1059,7 @@ __do_block_io_op(struct xen_blkif_ring *ring)
 			break;
 		}
 
-		pending_req = alloc_req(ring);
+		pending_req = alloc_req(blkif);
 		if (NULL == pending_req) {
 			blkif->st_oo_req++;
 			more_to_do = 1;
@@ -1094,7 +1094,7 @@ __do_block_io_op(struct xen_blkif_ring *ring)
 				goto done;
 			break;
 		case BLKIF_OP_DISCARD:
-			free_req(ring, pending_req);
+			free_req(blkif, pending_req);
 			if (dispatch_discard_io(ring, &req))
 				goto done;
 			break;
@@ -1325,7 +1325,7 @@ static int dispatch_rw_block_io(struct xen_blkif_ring *ring,
  fail_response:
 	/* Haven't submitted any bio's yet. */
 	make_response(ring, req->u.rw.id, req_operation, BLKIF_RSP_ERROR);
-	free_req(ring, pending_req);
+	free_req(blkif, pending_req);
 	msleep(1); /* back off a bit */
 	return -EIO;
 

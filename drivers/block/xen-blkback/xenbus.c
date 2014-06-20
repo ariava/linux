@@ -113,8 +113,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 						   int nr_rings)
 {
-	int r, i, j;
-	struct pending_req *req, *n;
+	int r;
 	struct xen_blkif_ring *rings;
 
 	if (nr_rings == blkif->allocated_rings)
@@ -122,41 +121,18 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 
 	rings = krealloc(blkif->rings, nr_rings * sizeof(struct xen_blkif_ring),
 			 GFP_KERNEL);
-	memset(rings + sizeof(struct xen_blkif_ring) * blkif->allocated_rings,
-	       0, (nr_rings - blkif->allocated_rings) *
-		  sizeof(struct xen_blkif_ring));
-
 	if (!rings)
 		return NULL;
 
 	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
 
+		/* Sanitize allocated structure */
+		memset(ring, 0, sizeof(struct xen_blkif_ring));
+
 		init_waitqueue_head(&ring->wq);
 		init_waitqueue_head(&ring->waiting_to_free);
 		init_waitqueue_head(&ring->shutdown_wq);
-		init_waitqueue_head(&ring->pending_free_wq);
-		INIT_LIST_HEAD(&ring->pending_free);
-		for (i = 0; i < XEN_BLKIF_REQS; i++) {
-			req = kzalloc(sizeof(*req), GFP_KERNEL);
-			if (!req)
-				goto fail;
-			list_add_tail(&req->free_list,
-			              &ring->pending_free);
-			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
-				req->segments[j] = kzalloc(sizeof(*req->segments[0]),
-				                           GFP_KERNEL);
-				if (!req->segments[j])
-					goto fail;
-			}
-			for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
-				req->indirect_pages[j] = kzalloc(sizeof(*req->indirect_pages[0]),
-				                                 GFP_KERNEL);
-				if (!req->indirect_pages[j])
-					goto fail;
-			}
-		}
-		spin_lock_init(&ring->pending_free_lock);
 		ring->blkif = blkif;
 		ring->ring_index = r;
 	}
@@ -164,32 +140,13 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	blkif->allocated_rings = nr_rings;
 
 	return rings;
-
-fail:
-	for (r = 0 ; r < nr_rings ; r++) {
-		struct xen_blkif_ring *ring = &rings[r];
-		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
-			list_del(&req->free_list);
-			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
-				if (!req->segments[j])
-					break;
-				kfree(req->segments[j]);
-			}
-			for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
-				if (!req->indirect_pages[j])
-					break;
-				kfree(req->indirect_pages[j]);
-			}
-			kfree(req);
-		}
-	}
-
-	return NULL;
 }
 
 static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 {
 	struct xen_blkif *blkif;
+	struct pending_req *req;
+	int i, j;
 
 	BUILD_BUG_ON(MAX_INDIRECT_PAGES > BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST);
 
@@ -204,6 +161,29 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	blkif->rings = xen_blkif_ring_alloc(blkif, 1);
 	if (!blkif->rings)
 		goto fail;
+
+	init_waitqueue_head(&blkif->pending_free_wq);
+	INIT_LIST_HEAD(&blkif->pending_free);
+	for (i = 0; i < XEN_BLKIF_REQS; i++) {
+		req = kzalloc(sizeof(*req), GFP_KERNEL);
+		if (!req)
+			goto fail;
+		list_add_tail(&req->free_list,
+		              &blkif->pending_free);
+		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
+			req->segments[j] = kzalloc(sizeof(*req->segments[0]),
+			                           GFP_KERNEL);
+			if (!req->segments[j])
+				goto fail;
+		}
+		for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
+			req->indirect_pages[j] = kzalloc(sizeof(*req->indirect_pages[0]),
+			                                 GFP_KERNEL);
+			if (!req->indirect_pages[j])
+				goto fail;
+		}
+	}
+	spin_lock_init(&blkif->pending_free_lock);
 
 	blkif->domid = domid;
 	spin_lock_init(&blkif->blk_ring_lock);
@@ -312,7 +292,7 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 static void xen_blkif_free(struct xen_blkif *blkif)
 {
 	struct pending_req *req, *n;
-	int i, j, r;
+	int i = 0, j;
 
 	if (!atomic_dec_and_test(&blkif->refcnt))
 		BUG();
@@ -328,24 +308,23 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 	BUG_ON(!list_empty(&blkif->free_pages));
 	BUG_ON(!RB_EMPTY_ROOT(&blkif->persistent_gnts));
 
-	for (r = 0 ; r < blkif->allocated_rings ; r++) {
-		struct xen_blkif_ring *ring = &blkif->rings[r];
-		i = 0;
-		/* Check that there is no request in use */
-		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
-			list_del(&req->free_list);
-
-			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++)
-				kfree(req->segments[j]);
-
-			for (j = 0; j < MAX_INDIRECT_PAGES; j++)
-				kfree(req->indirect_pages[j]);
-
-			kfree(req);
-			i++;
+	/* Check that there is no request in use */
+	list_for_each_entry_safe(req, n, &blkif->pending_free, free_list) {
+		list_del(&req->free_list);
+		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
+			if (!req->segments[j])
+				break;
+			kfree(req->segments[j]);
 		}
-		WARN_ON(i != XEN_BLKIF_REQS);
+		for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
+			if (!req->segments[j])
+				break;
+			kfree(req->indirect_pages[j]);
+		}
+		kfree(req);
+		i++;
 	}
+	WARN_ON(i != XEN_BLKIF_REQS);
 
 	kfree(blkif->rings);
 
