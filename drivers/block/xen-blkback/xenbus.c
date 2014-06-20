@@ -429,6 +429,41 @@ static void xen_vbd_free(struct xen_vbd *vbd)
 	vbd->bdev = NULL;
 }
 
+static int xen_advertise_hw_queues(struct xen_blkif *blkif,
+				   struct request_queue *q)
+{
+	struct xen_vbd *vbd = &blkif->vbd;
+	struct xenbus_transaction xbt;
+	int err;
+
+	if (q && q->mq_ops)
+		vbd->nr_supported_hw_queues = q->nr_hw_queues;
+
+	err = xenbus_transaction_start(&xbt);
+	if (err) {
+		BUG_ON(!blkif->be);
+		xenbus_dev_fatal(blkif->be->dev, err, "starting transaction (hw queues)");
+		return err;
+	}
+
+	err = xenbus_printf(xbt, blkif->be->dev->nodename, "nr_supported_hw_queues", "%u",
+			    blkif->vbd.nr_supported_hw_queues);
+	if (err)
+		xenbus_dev_error(blkif->be->dev, err, "writing %s/nr_supported_hw_queues",
+				 blkif->be->dev->nodename);
+
+	xenbus_transaction_end(xbt, 0);
+
+	if (vbd->nr_supported_hw_queues > 1) {
+		blkif->rings = xen_blkif_ring_alloc(blkif,
+			vbd->nr_supported_hw_queues);
+		if (!blkif->rings)
+			return -ENOMEM;
+	}
+
+	return err;
+}
+
 static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 			  unsigned major, unsigned minor, int readonly,
 			  int cdrom)
@@ -436,6 +471,7 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	struct xen_vbd *vbd;
 	struct block_device *bdev;
 	struct request_queue *q;
+	int err;
 
 	vbd = &blkif->vbd;
 	vbd->handle   = handle;
@@ -474,15 +510,9 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	if (q && blk_queue_secdiscard(q))
 		vbd->discard_secure = true;
 
-	if (q && q->mq_ops)
-		vbd->nr_supported_hw_queues = q->nr_hw_queues;
-
-	if (vbd->nr_supported_hw_queues > 1) {
-		blkif->rings = xen_blkif_ring_alloc(blkif,
-			vbd->nr_supported_hw_queues);
-		if (!blkif->rings)
-			return -ENOMEM;
-	}
+	err = xen_advertise_hw_queues(blkif, q);
+	if (err)
+		return -ENOENT;
 
 	DPRINTK("Successful creation of handle=%04x (dom=%u)\n",
 		handle, blkif->domid);
@@ -857,12 +887,6 @@ again:
 			    bdev_physical_block_size(be->blkif->vbd.bdev));
 	if (err)
 		xenbus_dev_error(dev, err, "writing %s/physical-sector-size",
-				 dev->nodename);
-
-	err = xenbus_printf(xbt, dev->nodename, "nr_supported_hw_queues", "%u",
-			    be->blkif->vbd.nr_supported_hw_queues);
-	if (err)
-		xenbus_dev_error(dev, err, "writing %s/nr_supported_hw_queues",
 				 dev->nodename);
 
 	err = xenbus_transaction_end(xbt, 0);
