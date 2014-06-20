@@ -99,7 +99,12 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 
 	for (i = 0 ; i < blkif->allocated_rings ; i++) {
 		ring = &blkif->rings[i];
-		snprintf(per_ring_name, TASK_COMM_LEN, "%s-%d", name, i);
+		if (blkif->vbd.nr_supported_hw_queues)
+			snprintf(per_ring_name, TASK_COMM_LEN, "%s-%d", name, i);
+		else {
+			BUG_ON(i != 0);
+			snprintf(per_ring_name, TASK_COMM_LEN, "%s", name);
+		}
 		ring->xenblkd = kthread_run(xen_blkif_schedule, ring, "%s", per_ring_name);
 		if (IS_ERR(ring->xenblkd)) {
 			err = PTR_ERR(ring->xenblkd);
