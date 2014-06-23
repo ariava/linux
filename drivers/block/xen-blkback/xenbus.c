@@ -41,7 +41,7 @@ struct xenbus_device *xen_blkbk_xenbus(struct backend_info *be)
 	return be->dev;
 }
 
-static int blkback_name(struct xen_blkif *blkif, char *buf)
+static int blkback_name(struct xen_blkif *blkif, char *buf, bool save_space)
 {
 	char *devpath, *devname;
 	struct xenbus_device *dev = blkif->be->dev;
@@ -56,7 +56,10 @@ static int blkback_name(struct xen_blkif *blkif, char *buf)
 	else
 		devname  = devpath;
 
-	snprintf(buf, TASK_COMM_LEN, "blkback.%d.%s", blkif->domid, devname);
+	if (save_space)
+		snprintf(buf, TASK_COMM_LEN, "blkbk.%d.%s", blkif->domid, devname);
+	else
+		snprintf(buf, TASK_COMM_LEN, "blkback.%d.%s", blkif->domid, devname);
 	kfree(devpath);
 
 	return 0;
@@ -84,7 +87,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	if (blkif->be->dev->state != XenbusStateConnected)
 		return;
 
-	err = blkback_name(blkif, name);
+	err = blkback_name(blkif, name, blkif->vbd.nr_supported_hw_queues);
 	if (err) {
 		xenbus_dev_error(blkif->be->dev, err, "get blkback dev name");
 		return;
