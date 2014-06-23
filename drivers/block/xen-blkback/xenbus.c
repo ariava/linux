@@ -75,7 +75,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 	 * Not ready to connect? Check irq of first ring as the others
 	 * should all be the same.
 	 */
-	if (!blkif->rings[0].irq || !blkif->vbd.bdev)
+	if (!blkif->rings || !blkif->rings[0].irq || !blkif->vbd.bdev)
 		return;
 
 	/* Already connected? */
@@ -124,19 +124,13 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	int r;
 	struct xen_blkif_ring *rings;
 
-	if (nr_rings == blkif->allocated_rings)
-		return blkif->rings;
-
-	rings = krealloc(blkif->rings, nr_rings * sizeof(struct xen_blkif_ring),
-			 GFP_KERNEL);
+	rings = kzalloc(nr_rings * sizeof(struct xen_blkif_ring),
+			GFP_KERNEL);
 	if (!rings)
 		return NULL;
 
-	for (r = blkif->allocated_rings ; r < nr_rings ; r++) {
+	for (r = 0 ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
-
-		/* Sanitize allocated structure */
-		memset(ring, 0, sizeof(struct xen_blkif_ring));
 
 		init_waitqueue_head(&ring->wq);
 		init_waitqueue_head(&ring->waiting_to_free);
@@ -161,14 +155,6 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	blkif = kmem_cache_zalloc(xen_blkif_cachep, GFP_KERNEL);
 	if (!blkif)
 		return ERR_PTR(-ENOMEM);
-
-	/*
-	 * Allocate a dummy ring, since we still don't know how many hardware
-	 * queues we have.
-	 */
-	blkif->rings = xen_blkif_ring_alloc(blkif, 1);
-	if (!blkif->rings)
-		goto fail;
 
 	init_waitqueue_head(&blkif->pending_free_wq);
 	INIT_LIST_HEAD(&blkif->pending_free);
@@ -457,12 +443,10 @@ static int xen_advertise_hw_queues(struct xen_blkif *blkif,
 
 	xenbus_transaction_end(xbt, 0);
 
-	if (vbd->nr_supported_hw_queues > 1) {
-		blkif->rings = xen_blkif_ring_alloc(blkif,
-			vbd->nr_supported_hw_queues);
-		if (!blkif->rings)
-			return -ENOMEM;
-	}
+	blkif->rings = xen_blkif_ring_alloc(blkif,
+		       vbd->nr_supported_hw_queues ? : 1);
+	if (!blkif->rings)
+		return -ENOMEM;
 
 	return err;
 }
