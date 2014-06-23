@@ -112,7 +112,7 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 		if (IS_ERR(ring->xenblkd)) {
 			err = PTR_ERR(ring->xenblkd);
 			ring->xenblkd = NULL;
-			xenbus_dev_error(blkif->be->dev, err, "start xenblkd");
+			xenbus_dev_error(blkif->be->dev, err, "start %s", per_ring_name);
 			return;
 		}
 	}
@@ -969,11 +969,11 @@ static int connect_ring(struct backend_info *be)
 
 	for (i = 0; i < blkif->allocated_rings ; i++) {
 		pr_info(DRV_PFX "ring-ref %ld, event-channel %d, protocol %d (%s) %s\n",
-			ring_ref[i], evtchn[i], be->blkif->blk_protocol, protocol,
+			ring_ref[i], evtchn[i], blkif->blk_protocol, protocol,
 			pers_grants ? "persistent grants" : "");
 
 		/* Map the shared frame, irq etc. */
-		err = xen_blkif_map(&be->blkif->rings[i], ring_ref[i], evtchn[i]);
+		err = xen_blkif_map(&blkif->rings[i], ring_ref[i], evtchn[i], i);
 		if (err) {
 			xenbus_dev_fatal(dev, err, "mapping ring-ref %lu port %u of ring %d",
 					 ring_ref[i], evtchn[i], i);
