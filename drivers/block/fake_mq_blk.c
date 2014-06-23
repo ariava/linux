@@ -12,6 +12,10 @@
 static int fake_mq_major;
 static int submit_queues;
 
+static int nr_submit_queues = 0;
+module_param(nr_submit_queues, int, S_IRUGO);
+MODULE_PARM_DESC(nr_submit_queues, "Number of supported submit queues");
+
 static int gb = 250;
 module_param(gb, int, S_IRUGO);
 MODULE_PARM_DESC(gb, "Size in GB");
@@ -47,7 +51,8 @@ static void fake_mq_transfer(char *buffer, int write,
 			     unsigned long nbytes,
 			     struct blk_mq_hw_ctx *hctx)
 {
-	if (!write)
+	/* Avoid setting memory if we cannot rely on CPU number - go faster */
+	if (!write && (submit_queues == nr_cpu_ids))
 		memset(buffer, *(char *)hctx->driver_data, nbytes);
 }
 
@@ -183,7 +188,10 @@ static void fake_mq_del_dev(struct fake_mq *fake_mq)
 
 static int __init fake_mq_init(void)
 {
-	submit_queues = nr_cpu_ids;
+	if (nr_submit_queues)
+		submit_queues = nr_submit_queues;
+	else
+		submit_queues = nr_cpu_ids;
 
 	fake_mq_major = register_blkdev(0, "fake_mq");
 	if (fake_mq_major < 0)
