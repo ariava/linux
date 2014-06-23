@@ -203,14 +203,16 @@ fail:
 }
 
 static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
-			 unsigned int evtchn)
+			 unsigned int evtchn, unsigned int ring_idx)
 {
 	int err;
 	struct xen_blkif *blkif;
+	char dev_name[64];
 
 	/* Already connected through? */
 	if (ring->irq)
 		return 0;
+
 	blkif = ring->blkif;
 
 	err = xenbus_map_ring_valloc(blkif->be->dev, shared_page, &ring->blk_ring);
@@ -243,9 +245,13 @@ static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
 		BUG();
 	}
 
+	if (blkif->vbd.nr_supported_hw_queues)
+		snprintf(dev_name, 64, "blkif-backend-%d", ring_idx);
+	else
+		snprintf(dev_name, 64, "blkif-backend");
 	err = bind_interdomain_evtchn_to_irqhandler(blkif->domid, evtchn,
 						    xen_blkif_be_int, 0,
-						    "blkif-backend", ring);
+						    dev_name, ring);
 	if (err < 0) {
 		xenbus_unmap_ring_vfree(blkif->be->dev, ring->blk_ring);
 		ring->blk_rings.common.sring = NULL;
