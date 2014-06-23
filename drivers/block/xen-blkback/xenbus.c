@@ -987,6 +987,9 @@ static int connect_ring(struct backend_info *be)
 		}
 	}
 
+	kfree(ring_ref);
+	kfree(evtchn);
+
 	return 0;
 
 fail:
