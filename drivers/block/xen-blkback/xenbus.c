@@ -449,11 +449,6 @@ static int xen_advertise_hw_queues(struct xen_blkif *blkif,
 
 	xenbus_transaction_end(xbt, 0);
 
-	blkif->rings = xen_blkif_ring_alloc(blkif,
-		       vbd->nr_supported_hw_queues ? : 1);
-	if (!blkif->rings)
-		return -ENOMEM;
-
 	return err;
 }
 
@@ -908,25 +903,27 @@ static int connect_ring(struct backend_info *be)
 	unsigned int pers_grants;
 	char protocol[64] = "", ring_ref_s[64] = "", evtchn_s[64] = "";
 	int i, err;
+	bool retry = false;
 
 	DPRINTK("%s", dev->otherend);
 
-	/* We should already have the number of supported hw queues */
-	BUG_ON(blkif->vbd.nr_supported_hw_queues ?
-	       blkif->vbd.nr_supported_hw_queues != blkif->allocated_rings :
-	       blkif->allocated_rings != 1);
-	ring_ref = kzalloc(sizeof(unsigned long) * blkif->allocated_rings,
+#define BLKIF_NR_RINGS(blkif)	(blkif->vbd.nr_supported_hw_queues ? : 1)
+
+	ring_ref = kzalloc(sizeof(unsigned long) * BLKIF_NR_RINGS(blkif),
 			   GFP_KERNEL);
 	if (!ring_ref)
 		return -ENOMEM;
-	evtchn = kzalloc(sizeof(unsigned int) * blkif->allocated_rings,
+	evtchn = kzalloc(sizeof(unsigned int) * BLKIF_NR_RINGS(blkif),
 			 GFP_KERNEL);
 	if (!evtchn) {
 		kfree(ring_ref);
 		return -ENOMEM;
 	}
 
-	for (i = 0 ; i < blkif->allocated_rings ; i++) {
+retry:
+	if (retry)
+		blkif->vbd.nr_supported_hw_queues = 0;
+	for (i = 0 ; i < BLKIF_NR_RINGS(blkif) ; i++) {
 		if (blkif->vbd.nr_supported_hw_queues == 0) {
 			BUG_ON(i != 0);
 			/* Support old XenStore keys for compatibility */
@@ -943,7 +940,10 @@ static int connect_ring(struct backend_info *be)
 			xenbus_dev_fatal(dev, err,
 					 "reading %s/%s and event-channel",
 					 dev->otherend, ring_ref_s);
-			/* XXX distinguish between mq-capable and non-mq-capable */
+			if (i == 0 && blkif->vbd.nr_supported_hw_queues) {
+				retry = true;
+				goto retry;
+			}
 			goto fail;
 		}
 	}
@@ -972,6 +972,16 @@ static int connect_ring(struct backend_info *be)
 
 	be->blkif->vbd.feature_gnt_persistent = pers_grants;
 	be->blkif->vbd.overflow_max_grants = 0;
+
+	blkif->rings = xen_blkif_ring_alloc(blkif, BLKIF_NR_RINGS(blkif));
+	if (!blkif->rings) {
+		err = -ENOMEM;
+		goto fail;
+	}
+	/* Enforce postcondition on number of allocated rings */
+	BUG_ON(blkif->vbd.nr_supported_hw_queues ?
+	       blkif->vbd.nr_supported_hw_queues != blkif->allocated_rings :
+	       blkif->allocated_rings != 1);
 
 	for (i = 0; i < blkif->allocated_rings ; i++) {
 		pr_info(DRV_PFX "ring-ref %ld, event-channel %d, protocol %d (%s) %s\n",
