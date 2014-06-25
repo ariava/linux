@@ -111,6 +111,8 @@ struct blkfront_ring_info
 	struct blk_shadow shadow[BLK_RING_SIZE];
 	unsigned long shadow_free;
 
+	struct work_struct work;
+	struct gnttab_free_callback callback;
 	struct list_head grants;
 	struct list_head indirect_pages;
 	unsigned int persistent_gnts_c;
@@ -136,8 +138,6 @@ struct blkfront_info
 	unsigned int nr_rings;
 	struct blkfront_ring_info *rinfo;
 	struct request_queue *rq;
-	struct work_struct work;
-	struct gnttab_free_callback callback;
 	unsigned int feature_flush;
 	unsigned int flush_op;
 	unsigned int feature_discard:1;
@@ -344,8 +344,8 @@ static void xlbd_release_minors(unsigned int minor, unsigned int nr)
 
 static void blkif_restart_queue_callback(void *arg)
 {
-	struct blkfront_info *info = (struct blkfront_info *)arg;
-	schedule_work(&info->work);
+	struct blkfront_ring_info *rinfo = (struct blkfront_ring_info *)arg;
+	schedule_work(&rinfo->work);
 }
 
 static int blkif_getgeo(struct block_device *bd, struct hd_geometry *hg)
@@ -443,10 +443,9 @@ static int blkif_queue_request(struct request *req, unsigned int ring_idx)
 		    max_grefs - rinfo->persistent_gnts_c,
 		    &gref_head) < 0) {
 			gnttab_request_free_callback(
-				&info->callback,
-				/* XXX move callback to be per-ring */
+				&rinfo->callback,
 				blkif_restart_queue_callback,
-				info,
+				rinfo,
 				max_grefs);
 			return 1;
 		}
@@ -455,7 +454,7 @@ static int blkif_queue_request(struct request *req, unsigned int ring_idx)
 
 	/* Fill out a communications ring structure. */
 	ring_req = RING_GET_REQUEST(ring, ring->req_prod_pvt);
-	id = get_id_from_freelist(&info->rinfo[ring_idx]);
+	id = get_id_from_freelist(rinfo);
 	rinfo->shadow[id].request = req;
 
 	if (unlikely(req->cmd_flags & (REQ_DISCARD | REQ_SECURE))) {
@@ -970,6 +969,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 {
 	unsigned int minor, nr_minors;
 	unsigned long flags;
+	int i;
 
 	if (info->rq == NULL)
 		return;
@@ -983,11 +983,13 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 		blk_mq_stop_hw_queues(info->rq);
 
 	/* No more gnttab callback work. */
-	gnttab_cancel_free_callback(&info->callback);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		gnttab_cancel_free_callback(&info->rinfo[i].callback);
 	spin_unlock_irqrestore(&info->io_lock, flags);
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_work(&info->work);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		flush_work(&info->rinfo[i].work);
 
 	del_gendisk(info->gd);
 
@@ -1005,34 +1007,30 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	info->gd = NULL;
 }
 
-static void kick_pending_request_queues(struct blkfront_info *info)
+static void kick_pending_request_queues(struct blkfront_ring_info *rinfo)
 {
-	int i;
-
-	for (i = 0 ; i < info->nr_rings ; i++) {
-		if (!RING_FULL(&info->rinfo[i].ring)) {
-			/*
-			 * Re-enable calldowns and kick things off immediately.
-			 */
-			if (info->nr_hw_queues == 0) {
-				blk_start_queue(info->rq);
-				do_blkif_request(info->rq);
-			} else {
-				blk_mq_start_stopped_hw_queues(info->rq);
-				/* Having found one is enough to kick all */
-				break;
-			}
-		}
+	if (!RING_FULL(&rinfo->ring)) {
+		struct blkfront_info *info = rinfo->info;
+		/*
+		 * Re-enable calldowns and kick things off immediately.
+		 */
+		if (info->nr_hw_queues == 0) {
+			blk_start_queue(info->rq);
+			do_blkif_request(info->rq);
+		} else
+			blk_mq_start_stopped_hw_queues(info->rq);
 	}
 }
 
 static void blkif_restart_queue(struct work_struct *work)
 {
-	struct blkfront_info *info = container_of(work, struct blkfront_info, work);
+	struct blkfront_ring_info *rinfo = container_of(work,
+				struct blkfront_ring_info, work);
+	struct blkfront_info *info = rinfo->info;
 
 	spin_lock_irq(&info->io_lock);
 	if (info->connected == BLKIF_STATE_CONNECTED)
-		kick_pending_request_queues(info);
+		kick_pending_request_queues(rinfo);
 	spin_unlock_irq(&info->io_lock);
 }
 
@@ -1152,11 +1150,13 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 	}
 
 	/* No more gnttab callback work. */
-	gnttab_cancel_free_callback(&info->callback);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		gnttab_cancel_free_callback(&info->rinfo[i].callback);
 	spin_unlock_irq(&info->io_lock);
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_work(&info->work);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		flush_work(&info->rinfo[i].work);
 }
 
 static void blkif_completion(struct blk_shadow *s,
@@ -1357,7 +1357,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 	} else
 		rinfo->ring.sring->rsp_event = i + 1;
 
-	kick_pending_request_queues(info);
+	kick_pending_request_queues(rinfo);
 
 	spin_unlock_irqrestore(&info->io_lock, flags);
 
@@ -1556,8 +1556,6 @@ static int blkfront_probe(struct xenbus_device *dev,
 	info->xbdev = dev;
 	info->vdevice = vdevice;
 	info->connected = BLKIF_STATE_DISCONNECTED;
-	INIT_WORK(&info->work, blkif_restart_queue);
-
 
 	/* Front end dir is a number, which is used as the id. */
 	info->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
@@ -1595,6 +1593,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 		rinfo->persistent_gnts_c = 0;
 		INIT_LIST_HEAD(&rinfo->grants);
 		INIT_LIST_HEAD(&rinfo->indirect_pages);
+		INIT_WORK(&rinfo->work, blkif_restart_queue);
 		for (i = 0; i < BLK_RING_SIZE; i++)
 			rinfo->shadow[i].req.u.rw.id = i+1;
 		rinfo->shadow[BLK_RING_SIZE-1].req.u.rw.id = 0x0fffffff;
@@ -1733,7 +1732,8 @@ static int blkif_recover(struct blkfront_info *info)
 	info->connected = BLKIF_STATE_CONNECTED;
 
 	/* Kick any other new requests queued since we resumed */
-	kick_pending_request_queues(info);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		kick_pending_request_queues(&info->rinfo[i]);
 
 	/*
 	 * XXX this is most certainly buggy: we are in fact expected
@@ -2109,7 +2109,8 @@ static void blkfront_connect(struct blkfront_info *info)
 	/* Kick pending requests. */
 	spin_lock_irq(&info->io_lock);
 	info->connected = BLKIF_STATE_CONNECTED;
-	kick_pending_request_queues(info);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		kick_pending_request_queues(&info->rinfo[i]);
 	spin_unlock_irq(&info->io_lock);
 
 	add_disk(info->gd);
