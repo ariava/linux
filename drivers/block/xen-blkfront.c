@@ -105,6 +105,7 @@ MODULE_PARM_DESC(max, "Maximum amount of segments in indirect requests (default 
 
 struct blkfront_ring_info
 {
+	spinlock_t io_lock;
 	int ring_ref;
 	struct blkif_front_ring ring;
 	unsigned int evtchn, irq;
@@ -128,7 +129,6 @@ struct blkfront_ring_info
  */
 struct blkfront_info
 {
-	spinlock_t io_lock;
 	struct mutex mutex;
 	struct xenbus_device *xbdev;
 	struct gendisk *gd;
@@ -628,7 +628,7 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 		return BLK_MQ_RQ_QUEUE_ERROR;
 	}
 
-	spin_lock_irq(&info->io_lock);
+	spin_lock_irq(&rinfo->io_lock);
 	if (blkif_queue_request(req, rinfo->hctx_index)) {
 wait:
 		/*
@@ -641,7 +641,7 @@ wait:
 	}
 
 	flush_requests(info, rinfo->hctx_index);
-	spin_unlock_irq(&info->io_lock);
+	spin_unlock_irq(&rinfo->io_lock);
 	return BLK_MQ_RQ_QUEUE_OK;
 }
 
@@ -740,7 +740,7 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 	struct blkfront_info *info = gd->private_data;
 
 	if (info->nr_hw_queues == 0)
-		rq = blk_init_queue(do_blkif_request, &info->io_lock);
+		rq = blk_init_queue(do_blkif_request, &info->rinfo[0].io_lock);
 	else
 		rq = blk_mq_init_queue(&blkfront_mq_reg, info);
 	if (rq == NULL)
@@ -968,13 +968,18 @@ void blk_mq_free_queue(struct request_queue *q);
 static void xlvbd_release_gendisk(struct blkfront_info *info)
 {
 	unsigned int minor, nr_minors;
-	unsigned long flags;
+	unsigned long *flags;
 	int i;
 
 	if (info->rq == NULL)
 		return;
 
-	spin_lock_irqsave(&info->io_lock, flags);
+	flags = kzalloc(sizeof(unsigned long) * info->nr_rings,
+			GFP_KERNEL);
+	if (!flags)
+		return;
+	for (i = 0 ; i < info->nr_rings ; i++)
+		spin_lock_irqsave(&info->rinfo[i].io_lock, flags[i]);
 
 	/* No more blkif_request(). */
 	if (info->nr_hw_queues == 0)
@@ -983,9 +988,10 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 		blk_mq_stop_hw_queues(info->rq);
 
 	/* No more gnttab callback work. */
-	for (i = 0 ; i < info->nr_rings ; i++)
+	for (i = 0 ; i < info->nr_rings ; i++) {
 		gnttab_cancel_free_callback(&info->rinfo[i].callback);
-	spin_unlock_irqrestore(&info->io_lock, flags);
+		spin_unlock_irqrestore(&info->rinfo[i].io_lock, flags[i]);
+	}
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
 	for (i = 0 ; i < info->nr_rings ; i++)
@@ -1028,10 +1034,10 @@ static void blkif_restart_queue(struct work_struct *work)
 				struct blkfront_ring_info, work);
 	struct blkfront_info *info = rinfo->info;
 
-	spin_lock_irq(&info->io_lock);
+	spin_lock_irq(&rinfo->io_lock);
 	if (info->connected == BLKIF_STATE_CONNECTED)
 		kick_pending_request_queues(rinfo);
-	spin_unlock_irq(&info->io_lock);
+	spin_unlock_irq(&rinfo->io_lock);
 }
 
 static void blkif_free_ring(struct blkfront_ring_info *rinfo,
@@ -1102,7 +1108,8 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 	int i;
 
 	/* Prevent new requests being issued until we fix things up. */
-	spin_lock_irq(&info->io_lock);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		spin_lock_irq(&info->rinfo[i].io_lock);
 	info->connected = suspend ?
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
 	/* No more blkif_request(). */
@@ -1150,9 +1157,10 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 	}
 
 	/* No more gnttab callback work. */
-	for (i = 0 ; i < info->nr_rings ; i++)
+	for (i = 0 ; i < info->nr_rings ; i++) {
 		gnttab_cancel_free_callback(&info->rinfo[i].callback);
-	spin_unlock_irq(&info->io_lock);
+		spin_unlock_irq(&info->rinfo[i].io_lock);
+	}
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
 	for (i = 0 ; i < info->nr_rings ; i++)
@@ -1253,10 +1261,10 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 	struct blkfront_info *info = rinfo->info;
 	int error;
 
-	spin_lock_irqsave(&info->io_lock, flags);
+	spin_lock_irqsave(&rinfo->io_lock, flags);
 
 	if (unlikely(info->connected != BLKIF_STATE_CONNECTED)) {
-		spin_unlock_irqrestore(&info->io_lock, flags);
+		spin_unlock_irqrestore(&rinfo->io_lock, flags);
 		return IRQ_HANDLED;
 	}
 
@@ -1359,7 +1367,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 
 	kick_pending_request_queues(rinfo);
 
-	spin_unlock_irqrestore(&info->io_lock, flags);
+	spin_unlock_irqrestore(&rinfo->io_lock, flags);
 
 	return IRQ_HANDLED;
 }
@@ -1552,7 +1560,6 @@ static int blkfront_probe(struct xenbus_device *dev,
 	}
 
 	mutex_init(&info->mutex);
-	spin_lock_init(&info->io_lock);
 	info->xbdev = dev;
 	info->vdevice = vdevice;
 	info->connected = BLKIF_STATE_DISCONNECTED;
@@ -1594,6 +1601,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 		INIT_LIST_HEAD(&rinfo->grants);
 		INIT_LIST_HEAD(&rinfo->indirect_pages);
 		INIT_WORK(&rinfo->work, blkif_restart_queue);
+		spin_lock_init(&rinfo->io_lock);
 		for (i = 0; i < BLK_RING_SIZE; i++)
 			rinfo->shadow[i].req.u.rw.id = i+1;
 		rinfo->shadow[BLK_RING_SIZE-1].req.u.rw.id = 0x0fffffff;
@@ -1706,7 +1714,7 @@ static int blkif_recover(struct blkfront_info *info)
 	 * queue with more segments than what we can handle now.
 	 */
 	if (info->nr_hw_queues == 0) {
-		spin_lock_irq(&info->io_lock);
+		spin_lock_irq(&info->rinfo[0].io_lock);
 		while ((req = blk_fetch_request(info->rq)) != NULL) {
 			if (req->cmd_flags &
 			    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
@@ -1721,12 +1729,13 @@ static int blkif_recover(struct blkfront_info *info)
 				pr_alert("diskcache flush request found!\n");
 			__blk_put_request(info->rq, req);
 		}
-		spin_unlock_irq(&info->io_lock);
+		spin_unlock_irq(&info->rinfo[0].io_lock);
 	}
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
-	spin_lock_irq(&info->io_lock);
+	for (i = 0 ; i < info->nr_rings ; i++)
+		spin_lock_irq(&info->rinfo[i].io_lock);
 
 	/* Now safe for us to use the shared ring */
 	info->connected = BLKIF_STATE_CONNECTED;
@@ -1746,7 +1755,9 @@ static int blkif_recover(struct blkfront_info *info)
 		BUG_ON(req->nr_phys_segments > segs);
 		blk_requeue_request(info->rq, req);
 	}
-	spin_unlock_irq(&info->io_lock);
+
+	for (i = 0 ; i < info->nr_rings ; i++)
+		spin_unlock_irq(&info->rinfo[i].io_lock);
 
 	while ((bio = bio_list_pop(&bio_list)) != NULL) {
 		/* Traverse the list of pending bios and re-queue them */
@@ -2107,11 +2118,13 @@ static void blkfront_connect(struct blkfront_info *info)
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
 	/* Kick pending requests. */
-	spin_lock_irq(&info->io_lock);
-	info->connected = BLKIF_STATE_CONNECTED;
 	for (i = 0 ; i < info->nr_rings ; i++)
+		spin_lock_irq(&info->rinfo[i].io_lock);
+	info->connected = BLKIF_STATE_CONNECTED;
+	for (i = 0 ; i < info->nr_rings ; i++) {
 		kick_pending_request_queues(&info->rinfo[i]);
-	spin_unlock_irq(&info->io_lock);
+		spin_unlock_irq(&info->rinfo[i].io_lock);
+	}
 
 	add_disk(info->gd);
 
