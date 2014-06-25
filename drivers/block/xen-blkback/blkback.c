@@ -103,60 +103,60 @@ module_param(log_stats, int, 0644);
 /* Number of free pages to remove on each call to free_xenballooned_pages */
 #define NUM_BATCH_FREE_PAGES 10
 
-static inline int get_free_page(struct xen_blkif *blkif, struct page **page)
+static inline int get_free_page(struct xen_blkif_ring *ring, struct page **page)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&blkif->free_pages_lock, flags);
-	if (list_empty(&blkif->free_pages)) {
-		BUG_ON(blkif->free_pages_num != 0);
-		spin_unlock_irqrestore(&blkif->free_pages_lock, flags);
+	spin_lock_irqsave(&ring->free_pages_lock, flags);
+	if (list_empty(&ring->free_pages)) {
+		BUG_ON(ring->free_pages_num != 0);
+		spin_unlock_irqrestore(&ring->free_pages_lock, flags);
 		return alloc_xenballooned_pages(1, page, false);
 	}
-	BUG_ON(blkif->free_pages_num == 0);
-	page[0] = list_first_entry(&blkif->free_pages, struct page, lru);
+	BUG_ON(ring->free_pages_num == 0);
+	page[0] = list_first_entry(&ring->free_pages, struct page, lru);
 	list_del(&page[0]->lru);
-	blkif->free_pages_num--;
-	spin_unlock_irqrestore(&blkif->free_pages_lock, flags);
+	ring->free_pages_num--;
+	spin_unlock_irqrestore(&ring->free_pages_lock, flags);
 
 	return 0;
 }
 
-static inline void put_free_pages(struct xen_blkif *blkif, struct page **page,
-                                  int num)
+static inline void put_free_pages(struct xen_blkif_ring *ring,
+				  struct page **page, int num)
 {
 	unsigned long flags;
 	int i;
 
-	spin_lock_irqsave(&blkif->free_pages_lock, flags);
+	spin_lock_irqsave(&ring->free_pages_lock, flags);
 	for (i = 0; i < num; i++)
-		list_add(&page[i]->lru, &blkif->free_pages);
-	blkif->free_pages_num += num;
-	spin_unlock_irqrestore(&blkif->free_pages_lock, flags);
+		list_add(&page[i]->lru, &ring->free_pages);
+	ring->free_pages_num += num;
+	spin_unlock_irqrestore(&ring->free_pages_lock, flags);
 }
 
-static inline void shrink_free_pagepool(struct xen_blkif *blkif, int num)
+static inline void shrink_free_pagepool(struct xen_blkif_ring *ring, int num)
 {
 	/* Remove requested pages in batches of NUM_BATCH_FREE_PAGES */
 	struct page *page[NUM_BATCH_FREE_PAGES];
 	unsigned int num_pages = 0;
 	unsigned long flags;
 
-	spin_lock_irqsave(&blkif->free_pages_lock, flags);
-	while (blkif->free_pages_num > num) {
-		BUG_ON(list_empty(&blkif->free_pages));
-		page[num_pages] = list_first_entry(&blkif->free_pages,
+	spin_lock_irqsave(&ring->free_pages_lock, flags);
+	while (ring->free_pages_num > num) {
+		BUG_ON(list_empty(&ring->free_pages));
+		page[num_pages] = list_first_entry(&ring->free_pages,
 		                                   struct page, lru);
 		list_del(&page[num_pages]->lru);
-		blkif->free_pages_num--;
+		ring->free_pages_num--;
 		if (++num_pages == NUM_BATCH_FREE_PAGES) {
-			spin_unlock_irqrestore(&blkif->free_pages_lock, flags);
+			spin_unlock_irqrestore(&ring->free_pages_lock, flags);
 			free_xenballooned_pages(num_pages, page);
-			spin_lock_irqsave(&blkif->free_pages_lock, flags);
+			spin_lock_irqsave(&ring->free_pages_lock, flags);
 			num_pages = 0;
 		}
 	}
-	spin_unlock_irqrestore(&blkif->free_pages_lock, flags);
+	spin_unlock_irqrestore(&ring->free_pages_lock, flags);
 	if (num_pages != 0)
 		free_xenballooned_pages(num_pages, page);
 }
@@ -188,19 +188,20 @@ static void make_response(struct xen_blkif_ring *ring, u64 id,
  * bit operations to modify the flags of a persistent grant and to count
  * the number of used grants.
  */
-static int add_persistent_gnt(struct xen_blkif *blkif,
+static int add_persistent_gnt(struct xen_blkif_ring *ring,
 			       struct persistent_gnt *persistent_gnt)
 {
+	struct xen_blkif *blkif = ring->blkif;
 	struct rb_node **new = NULL, *parent = NULL;
 	struct persistent_gnt *this;
 
-	if (blkif->persistent_gnt_c >= xen_blkif_max_pgrants) {
+	if (ring->persistent_gnt_c >= xen_blkif_max_pgrants) {
 		if (!blkif->vbd.overflow_max_grants)
 			blkif->vbd.overflow_max_grants = 1;
 		return -EBUSY;
 	}
 	/* Figure out where to put new node */
-	new = &blkif->persistent_gnts.rb_node;
+	new = &ring->persistent_gnts.rb_node;
 	while (*new) {
 		this = container_of(*new, struct persistent_gnt, node);
 
@@ -219,19 +220,19 @@ static int add_persistent_gnt(struct xen_blkif *blkif,
 	set_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags);
 	/* Add new node and rebalance tree. */
 	rb_link_node(&(persistent_gnt->node), parent, new);
-	rb_insert_color(&(persistent_gnt->node), &blkif->persistent_gnts);
-	blkif->persistent_gnt_c++;
-	atomic_inc(&blkif->persistent_gnt_in_use);
+	rb_insert_color(&(persistent_gnt->node), &ring->persistent_gnts);
+	ring->persistent_gnt_c++;
+	atomic_inc(&ring->persistent_gnt_in_use);
 	return 0;
 }
 
-static struct persistent_gnt *get_persistent_gnt(struct xen_blkif *blkif,
+static struct persistent_gnt *get_persistent_gnt(struct xen_blkif_ring *ring,
 						 grant_ref_t gref)
 {
 	struct persistent_gnt *data;
 	struct rb_node *node = NULL;
 
-	node = blkif->persistent_gnts.rb_node;
+	node = ring->persistent_gnts.rb_node;
 	while (node) {
 		data = container_of(node, struct persistent_gnt, node);
 
@@ -245,25 +246,25 @@ static struct persistent_gnt *get_persistent_gnt(struct xen_blkif *blkif,
 				return NULL;
 			}
 			set_bit(PERSISTENT_GNT_ACTIVE, data->flags);
-			atomic_inc(&blkif->persistent_gnt_in_use);
+			atomic_inc(&ring->persistent_gnt_in_use);
 			return data;
 		}
 	}
 	return NULL;
 }
 
-static void put_persistent_gnt(struct xen_blkif *blkif,
+static void put_persistent_gnt(struct xen_blkif_ring *ring,
                                struct persistent_gnt *persistent_gnt)
 {
 	if(!test_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags))
 	          pr_alert_ratelimited(DRV_PFX " freeing a grant already unused");
 	set_bit(PERSISTENT_GNT_WAS_ACTIVE, persistent_gnt->flags);
 	clear_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags);
-	atomic_dec(&blkif->persistent_gnt_in_use);
+	atomic_dec(&ring->persistent_gnt_in_use);
 }
 
-static void free_persistent_gnts(struct xen_blkif *blkif, struct rb_root *root,
-                                 unsigned int num)
+static void free_persistent_gnts(struct xen_blkif_ring *ring,
+				 struct rb_root *root, unsigned int num)
 {
 	struct gnttab_unmap_grant_ref unmap[BLKIF_MAX_SEGMENTS_PER_REQUEST];
 	struct page *pages[BLKIF_MAX_SEGMENTS_PER_REQUEST];
@@ -288,7 +289,7 @@ static void free_persistent_gnts(struct xen_blkif *blkif, struct rb_root *root,
 			ret = gnttab_unmap_refs(unmap, NULL, pages,
 				segs_to_unmap);
 			BUG_ON(ret);
-			put_free_pages(blkif, pages, segs_to_unmap);
+			put_free_pages(ring, pages, segs_to_unmap);
 			segs_to_unmap = 0;
 		}
 
@@ -305,10 +306,10 @@ void xen_blkbk_unmap_purged_grants(struct work_struct *work)
 	struct page *pages[BLKIF_MAX_SEGMENTS_PER_REQUEST];
 	struct persistent_gnt *persistent_gnt;
 	int ret, segs_to_unmap = 0;
-	struct xen_blkif *blkif = container_of(work, typeof(*blkif), persistent_purge_work);
+	struct xen_blkif_ring *ring = container_of(work, typeof(*ring), persistent_purge_work);
 
-	while(!list_empty(&blkif->persistent_purge_list)) {
-		persistent_gnt = list_first_entry(&blkif->persistent_purge_list,
+	while(!list_empty(&ring->persistent_purge_list)) {
+		persistent_gnt = list_first_entry(&ring->persistent_purge_list,
 		                                  struct persistent_gnt,
 		                                  remove_node);
 		list_del(&persistent_gnt->remove_node);
@@ -324,7 +325,7 @@ void xen_blkbk_unmap_purged_grants(struct work_struct *work)
 			ret = gnttab_unmap_refs(unmap, NULL, pages,
 				segs_to_unmap);
 			BUG_ON(ret);
-			put_free_pages(blkif, pages, segs_to_unmap);
+			put_free_pages(ring, pages, segs_to_unmap);
 			segs_to_unmap = 0;
 		}
 		kfree(persistent_gnt);
@@ -332,34 +333,35 @@ void xen_blkbk_unmap_purged_grants(struct work_struct *work)
 	if (segs_to_unmap > 0) {
 		ret = gnttab_unmap_refs(unmap, NULL, pages, segs_to_unmap);
 		BUG_ON(ret);
-		put_free_pages(blkif, pages, segs_to_unmap);
+		put_free_pages(ring, pages, segs_to_unmap);
 	}
 }
 
-static void purge_persistent_gnt(struct xen_blkif *blkif)
+static void purge_persistent_gnt(struct xen_blkif_ring *ring)
 {
+	struct xen_blkif *blkif = ring->blkif;
 	struct persistent_gnt *persistent_gnt;
 	struct rb_node *n;
 	unsigned int num_clean, total;
 	bool scan_used = false, clean_used = false;
 	struct rb_root *root;
 
-	if (blkif->persistent_gnt_c < xen_blkif_max_pgrants ||
-	    (blkif->persistent_gnt_c == xen_blkif_max_pgrants &&
+	if (ring->persistent_gnt_c < xen_blkif_max_pgrants ||
+	    (ring->persistent_gnt_c == xen_blkif_max_pgrants &&
 	    !blkif->vbd.overflow_max_grants)) {
 		return;
 	}
 
-	if (work_pending(&blkif->persistent_purge_work)) {
+	if (work_pending(&ring->persistent_purge_work)) {
 		pr_alert_ratelimited(DRV_PFX "Scheduled work from previous purge is still pending, cannot purge list\n");
 		return;
 	}
 
 	num_clean = (xen_blkif_max_pgrants / 100) * LRU_PERCENT_CLEAN;
-	num_clean = blkif->persistent_gnt_c - xen_blkif_max_pgrants + num_clean;
-	num_clean = min(blkif->persistent_gnt_c, num_clean);
+	num_clean = ring->persistent_gnt_c - xen_blkif_max_pgrants + num_clean;
+	num_clean = min(ring->persistent_gnt_c, num_clean);
 	if ((num_clean == 0) ||
-	    (num_clean > (blkif->persistent_gnt_c - atomic_read(&blkif->persistent_gnt_in_use))))
+	    (num_clean > (ring->persistent_gnt_c - atomic_read(&ring->persistent_gnt_in_use))))
 		return;
 
 	/*
@@ -375,8 +377,8 @@ static void purge_persistent_gnt(struct xen_blkif *blkif)
 
 	pr_debug(DRV_PFX "Going to purge %u persistent grants\n", num_clean);
 
-	BUG_ON(!list_empty(&blkif->persistent_purge_list));
-	root = &blkif->persistent_gnts;
+	BUG_ON(!list_empty(&ring->persistent_purge_list));
+	root = &ring->persistent_gnts;
 purge_list:
 	foreach_grant_safe(persistent_gnt, n, root, node) {
 		BUG_ON(persistent_gnt->handle ==
@@ -395,7 +397,7 @@ purge_list:
 
 		rb_erase(&persistent_gnt->node, root);
 		list_add(&persistent_gnt->remove_node,
-		         &blkif->persistent_purge_list);
+		         &ring->persistent_purge_list);
 		if (--num_clean == 0)
 			goto finished;
 	}
@@ -416,11 +418,11 @@ finished:
 		goto purge_list;
 	}
 
-	blkif->persistent_gnt_c -= (total - num_clean);
+	ring->persistent_gnt_c -= (total - num_clean);
 	blkif->vbd.overflow_max_grants = 0;
 
 	/* We can defer this work */
-	schedule_work(&blkif->persistent_purge_work);
+	schedule_work(&ring->persistent_purge_work);
 	pr_debug(DRV_PFX "Purged %u/%u\n", (total - num_clean), total);
 	return;
 }
@@ -555,13 +557,13 @@ irqreturn_t xen_blkif_be_int(int irq, void *dev_id)
 
 static void print_stats(struct xen_blkif *blkif)
 {
-	pr_info("xen-blkback (%s): oo %3llu  |  rd %4llu  |  wr %4llu  |  f %4llu"
+	/*pr_info("xen-blkback (%s): oo %3llu  |  rd %4llu  |  wr %4llu  |  f %4llu"
 		 "  |  ds %4llu | pg: %4u/%4d\n",
 		 current->comm, blkif->st_oo_req,
 		 blkif->st_rd_req, blkif->st_wr_req,
 		 blkif->st_f_req, blkif->st_ds_req,
 		 blkif->persistent_gnt_c,
-		 xen_blkif_max_pgrants);
+		 xen_blkif_max_pgrants);*/
 	blkif->st_print = jiffies + msecs_to_jiffies(10 * 1000);
 	blkif->st_rd_req = 0;
 	blkif->st_wr_req = 0;
@@ -613,20 +615,20 @@ int xen_blkif_schedule(void *arg)
 
 purge_gnt_list:
 		if (blkif->vbd.feature_gnt_persistent &&
-		    time_after(jiffies, blkif->next_lru)) {
-			purge_persistent_gnt(blkif);
-			blkif->next_lru = jiffies + msecs_to_jiffies(LRU_INTERVAL);
+		    time_after(jiffies, ring->next_lru)) {
+			purge_persistent_gnt(ring);
+			ring->next_lru = jiffies + msecs_to_jiffies(LRU_INTERVAL);
 		}
 
 		/* Shrink if we have more than xen_blkif_max_buffer_pages */
-		shrink_free_pagepool(blkif, xen_blkif_max_buffer_pages);
+		shrink_free_pagepool(ring, xen_blkif_max_buffer_pages);
 
 		if (log_stats && time_after(jiffies, blkif->st_print))
 			print_stats(blkif);
 	}
 
 	/* Drain pending purge work */
-	flush_work(&blkif->persistent_purge_work);
+	flush_work(&ring->persistent_purge_work);
 
 	if (log_stats)
 		print_stats(blkif);
@@ -640,25 +642,25 @@ purge_gnt_list:
 /*
  * Remove persistent grants and empty the pool of free pages
  */
-void xen_blkbk_free_caches(struct xen_blkif *blkif)
+void xen_blkbk_free_caches(struct xen_blkif_ring *ring)
 {
 	/* Free all persistent grant pages */
-	if (!RB_EMPTY_ROOT(&blkif->persistent_gnts))
-		free_persistent_gnts(blkif, &blkif->persistent_gnts,
-			blkif->persistent_gnt_c);
+	if (!RB_EMPTY_ROOT(&ring->persistent_gnts))
+		free_persistent_gnts(ring, &ring->persistent_gnts,
+			ring->persistent_gnt_c);
 
-	BUG_ON(!RB_EMPTY_ROOT(&blkif->persistent_gnts));
-	blkif->persistent_gnt_c = 0;
+	BUG_ON(!RB_EMPTY_ROOT(&ring->persistent_gnts));
+	ring->persistent_gnt_c = 0;
 
 	/* Since we are shutting down remove all pages from the buffer */
-	shrink_free_pagepool(blkif, 0 /* All */);
+	shrink_free_pagepool(ring, 0 /* All */);
 }
 
 /*
  * Unmap the grant references, and also remove the M2P over-rides
  * used in the 'pending_req'.
  */
-static void xen_blkbk_unmap(struct xen_blkif *blkif,
+static void xen_blkbk_unmap(struct xen_blkif_ring *ring,
                             struct grant_page *pages[],
                             int num)
 {
@@ -669,7 +671,7 @@ static void xen_blkbk_unmap(struct xen_blkif *blkif,
 
 	for (i = 0; i < num; i++) {
 		if (pages[i]->persistent_gnt != NULL) {
-			put_persistent_gnt(blkif, pages[i]->persistent_gnt);
+			put_persistent_gnt(ring, pages[i]->persistent_gnt);
 			continue;
 		}
 		if (pages[i]->handle == BLKBACK_INVALID_HANDLE)
@@ -682,21 +684,22 @@ static void xen_blkbk_unmap(struct xen_blkif *blkif,
 			ret = gnttab_unmap_refs(unmap, NULL, unmap_pages,
 			                        invcount);
 			BUG_ON(ret);
-			put_free_pages(blkif, unmap_pages, invcount);
+			put_free_pages(ring, unmap_pages, invcount);
 			invcount = 0;
 		}
 	}
 	if (invcount) {
 		ret = gnttab_unmap_refs(unmap, NULL, unmap_pages, invcount);
 		BUG_ON(ret);
-		put_free_pages(blkif, unmap_pages, invcount);
+		put_free_pages(ring, unmap_pages, invcount);
 	}
 }
 
-static int xen_blkbk_map(struct xen_blkif *blkif,
+static int xen_blkbk_map(struct xen_blkif_ring *ring,
 			 struct grant_page *pages[],
 			 int num, bool ro)
 {
+	struct xen_blkif *blkif = ring->blkif;
 	struct gnttab_map_grant_ref map[BLKIF_MAX_SEGMENTS_PER_REQUEST];
 	struct page *pages_to_gnt[BLKIF_MAX_SEGMENTS_PER_REQUEST];
 	struct persistent_gnt *persistent_gnt = NULL;
@@ -720,7 +723,7 @@ again:
 
 		if (use_persistent_gnts)
 			persistent_gnt = get_persistent_gnt(
-				blkif,
+				ring,
 				pages[i]->gref);
 
 		if (persistent_gnt) {
@@ -731,7 +734,7 @@ again:
 			pages[i]->page = persistent_gnt->page;
 			pages[i]->persistent_gnt = persistent_gnt;
 		} else {
-			if (get_free_page(blkif, &pages[i]->page))
+			if (get_free_page(ring, &pages[i]->page))
 				goto out_of_memory;
 			addr = vaddr(pages[i]->page);
 			pages_to_gnt[segs_to_map] = pages[i]->page;
@@ -773,7 +776,7 @@ again:
 			continue;
 		}
 		if (use_persistent_gnts &&
-		    blkif->persistent_gnt_c < xen_blkif_max_pgrants) {
+		    ring->persistent_gnt_c < xen_blkif_max_pgrants) {
 			/*
 			 * We are using persistent grants, the grant is
 			 * not mapped but we might have room for it.
@@ -791,7 +794,7 @@ again:
 			persistent_gnt->gnt = map[new_map_idx].ref;
 			persistent_gnt->handle = map[new_map_idx].handle;
 			persistent_gnt->page = pages[seg_idx]->page;
-			if (add_persistent_gnt(blkif,
+			if (add_persistent_gnt(ring,
 			                       persistent_gnt)) {
 				kfree(persistent_gnt);
 				persistent_gnt = NULL;
@@ -799,7 +802,7 @@ again:
 			}
 			pages[seg_idx]->persistent_gnt = persistent_gnt;
 			pr_debug(DRV_PFX " grant %u added to the tree of persistent grants, using %u/%u\n",
-				 persistent_gnt->gnt, blkif->persistent_gnt_c,
+				 persistent_gnt->gnt, ring->persistent_gnt_c,
 				 xen_blkif_max_pgrants);
 			goto next;
 		}
@@ -824,7 +827,7 @@ next:
 
 out_of_memory:
 	pr_alert(DRV_PFX "%s: out of memory\n", __func__);
-	put_free_pages(blkif, pages_to_gnt, segs_to_map);
+	put_free_pages(ring, pages_to_gnt, segs_to_map);
 	return -ENOMEM;
 }
 
@@ -832,7 +835,7 @@ static int xen_blkbk_map_seg(struct pending_req *pending_req)
 {
 	int rc;
 
-	rc = xen_blkbk_map(pending_req->ring->blkif, pending_req->segments,
+	rc = xen_blkbk_map(pending_req->ring, pending_req->segments,
 			   pending_req->nr_pages,
 	                   (pending_req->operation != BLKIF_OP_READ));
 
@@ -846,7 +849,6 @@ static int xen_blkbk_parse_indirect(struct blkif_request *req,
 {
 	struct grant_page **pages = pending_req->indirect_pages;
 	struct xen_blkif_ring *ring = pending_req->ring;
-	struct xen_blkif *blkif = ring->blkif;
 	int indirect_grefs, rc, n, nseg, i;
 	struct blkif_request_segment *segments = NULL;
 
@@ -857,7 +859,7 @@ static int xen_blkbk_parse_indirect(struct blkif_request *req,
 	for (i = 0; i < indirect_grefs; i++)
 		pages[i]->gref = req->u.indirect.indirect_grefs[i];
 
-	rc = xen_blkbk_map(blkif, pages, indirect_grefs, true);
+	rc = xen_blkbk_map(ring, pages, indirect_grefs, true);
 	if (rc)
 		goto unmap;
 
@@ -884,7 +886,7 @@ static int xen_blkbk_parse_indirect(struct blkif_request *req,
 unmap:
 	if (segments)
 		kunmap_atomic(segments);
-	xen_blkbk_unmap(blkif, pages, indirect_grefs);
+	xen_blkbk_unmap(ring, pages, indirect_grefs);
 	return rc;
 }
 
@@ -988,7 +990,7 @@ static void __end_block_io_op(struct pending_req *pending_req, int error)
 		struct xen_blkif_ring *ring = pending_req->ring;
 		struct xen_blkif *blkif = ring->blkif;
 
-		xen_blkbk_unmap(blkif,
+		xen_blkbk_unmap(ring,
 		                pending_req->segments,
 		                pending_req->nr_pages);
 		make_response(ring, pending_req->id,
@@ -1320,7 +1322,7 @@ static int dispatch_rw_block_io(struct xen_blkif_ring *ring,
 	return 0;
 
  fail_flush:
-	xen_blkbk_unmap(blkif, pending_req->segments,
+	xen_blkbk_unmap(ring, pending_req->segments,
 	                pending_req->nr_pages);
  fail_response:
 	/* Haven't submitted any bio's yet. */

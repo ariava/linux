@@ -272,6 +272,22 @@ struct xen_blkif_ring {
 	/* Thread shutdown wait queue. */
 	wait_queue_head_t	shutdown_wq;
 
+	/* buffer of free pages to map grant refs */
+	spinlock_t		free_pages_lock;
+	int			free_pages_num;
+
+	/* used by the kworker that offload work from the persistent purge */
+	struct list_head	persistent_purge_list;
+	struct work_struct	persistent_purge_work;
+
+	/* tree to store persistent grants */
+	struct rb_root		persistent_gnts;
+	unsigned int		persistent_gnt_c;
+	atomic_t		persistent_gnt_in_use;
+	unsigned long           next_lru;
+
+	struct list_head	free_pages;
+
 	struct xen_blkif	*blkif;
 	unsigned		ring_index;
 };
@@ -299,26 +315,10 @@ struct xen_blkif {
 	spinlock_t		pending_free_lock;
 	wait_queue_head_t	pending_free_wq;
 
-
 	/* for barrier (drain) requests */
 	struct completion	drain_complete;
 	atomic_t		drain;
 	atomic_t		inflight;
-
-	/* tree to store persistent grants */
-	struct rb_root		persistent_gnts;
-	unsigned int		persistent_gnt_c;
-	atomic_t		persistent_gnt_in_use;
-	unsigned long           next_lru;
-
-	/* used by the kworker that offload work from the persistent purge */
-	struct list_head	persistent_purge_list;
-	struct work_struct	persistent_purge_work;
-
-	/* buffer of free pages to map grant refs */
-	spinlock_t		free_pages_lock;
-	int			free_pages_num;
-	struct list_head	free_pages;
 
 	/* statistics */
 	unsigned long		st_print;
@@ -389,7 +389,7 @@ int xen_blkif_xenbus_init(void);
 irqreturn_t xen_blkif_be_int(int irq, void *dev_id);
 int xen_blkif_schedule(void *arg);
 int xen_blkif_purge_persistent(void *arg);
-void xen_blkbk_free_caches(struct xen_blkif *blkif);
+void xen_blkbk_free_caches(struct xen_blkif_ring *ring);
 
 int xen_blkbk_flush_diskcache(struct xenbus_transaction xbt,
 			      struct backend_info *be, int state);
