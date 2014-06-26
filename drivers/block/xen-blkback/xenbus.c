@@ -121,8 +121,9 @@ static void xen_update_blkif_status(struct xen_blkif *blkif)
 static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 						   int nr_rings)
 {
-	int r;
+	int r, i, j;
 	struct xen_blkif_ring *rings;
+	struct pending_req *req;
 
 	rings = kzalloc(nr_rings * sizeof(struct xen_blkif_ring),
 			GFP_KERNEL);
@@ -143,6 +144,28 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 		ring->free_pages_num = 0;
 		atomic_set(&ring->persistent_gnt_in_use, 0);
 		INIT_WORK(&ring->persistent_purge_work, xen_blkbk_unmap_purged_grants);
+		spin_lock_init(&ring->pending_free_lock);
+		init_waitqueue_head(&ring->pending_free_wq);
+		INIT_LIST_HEAD(&ring->pending_free);
+		for (i = 0; i < XEN_BLKIF_REQS; i++) {
+			req = kzalloc(sizeof(*req), GFP_KERNEL);
+			if (!req)
+				goto fail;
+			list_add_tail(&req->free_list,
+				      &ring->pending_free);
+			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
+				req->segments[j] = kzalloc(sizeof(*req->segments[0]),
+				                           GFP_KERNEL);
+				if (!req->segments[j])
+					goto fail;
+			}
+			for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
+				req->indirect_pages[j] = kzalloc(sizeof(*req->indirect_pages[0]),
+				                                 GFP_KERNEL);
+				if (!req->indirect_pages[j])
+					goto fail;
+			}
+		}
 
 		ring->blkif = blkif;
 		ring->ring_index = r;
@@ -151,42 +174,21 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	blkif->allocated_rings = nr_rings;
 
 	return rings;
+
+fail:
+	kfree(rings);
+	return NULL;
 }
 
 static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 {
 	struct xen_blkif *blkif;
-	struct pending_req *req;
-	int i, j;
 
 	BUILD_BUG_ON(MAX_INDIRECT_PAGES > BLKIF_MAX_INDIRECT_PAGES_PER_REQUEST);
 
 	blkif = kmem_cache_zalloc(xen_blkif_cachep, GFP_KERNEL);
 	if (!blkif)
 		return ERR_PTR(-ENOMEM);
-
-	init_waitqueue_head(&blkif->pending_free_wq);
-	INIT_LIST_HEAD(&blkif->pending_free);
-	for (i = 0; i < XEN_BLKIF_REQS; i++) {
-		req = kzalloc(sizeof(*req), GFP_KERNEL);
-		if (!req)
-			goto fail;
-		list_add_tail(&req->free_list,
-		              &blkif->pending_free);
-		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
-			req->segments[j] = kzalloc(sizeof(*req->segments[0]),
-			                           GFP_KERNEL);
-			if (!req->segments[j])
-				goto fail;
-		}
-		for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
-			req->indirect_pages[j] = kzalloc(sizeof(*req->indirect_pages[0]),
-			                                 GFP_KERNEL);
-			if (!req->indirect_pages[j])
-				goto fail;
-		}
-	}
-	spin_lock_init(&blkif->pending_free_lock);
 
 	blkif->domid = domid;
 	spin_lock_init(&blkif->blk_ring_lock);
@@ -197,11 +199,6 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	blkif->st_print = jiffies;
 
 	return blkif;
-
-fail:
-	kmem_cache_free(xen_blkif_cachep, blkif);
-
-	return ERR_PTR(-ENOMEM);
 }
 
 static int xen_blkif_map(struct xen_blkif_ring *ring, unsigned long shared_page,
@@ -294,13 +291,13 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 static void xen_blkif_free(struct xen_blkif *blkif)
 {
 	struct pending_req *req, *n;
-	int i = 0, j;
+	int i, j, r;
 
 	if (!atomic_dec_and_test(&blkif->refcnt))
 		BUG();
 
-	for (i = 0 ; i < blkif->allocated_rings ; i++) {
-		struct xen_blkif_ring *ring = &blkif->rings[i];
+	for (r = 0 ; r < blkif->allocated_rings ; r++) {
+		struct xen_blkif_ring *ring = &blkif->rings[r];
 
 		/* Remove all persistent grants and the cache of ballooned pages. */
 		xen_blkbk_free_caches(ring);
@@ -312,25 +309,26 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 		BUG_ON(!list_empty(&ring->persistent_purge_list));
 		BUG_ON(!list_empty(&ring->free_pages));
 		BUG_ON(!RB_EMPTY_ROOT(&ring->persistent_gnts));
-	}
 
-	/* Check that there is no request in use */
-	list_for_each_entry_safe(req, n, &blkif->pending_free, free_list) {
-		list_del(&req->free_list);
-		for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
-			if (!req->segments[j])
-				break;
-			kfree(req->segments[j]);
+		i = 0;
+		/* Check that there is no request in use */
+		list_for_each_entry_safe(req, n, &ring->pending_free, free_list) {
+			list_del(&req->free_list);
+			for (j = 0; j < MAX_INDIRECT_SEGMENTS; j++) {
+				if (!req->segments[j])
+					break;
+				kfree(req->segments[j]);
+			}
+			for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
+				if (!req->segments[j])
+					break;
+				kfree(req->indirect_pages[j]);
+			}
+			kfree(req);
+			i++;
 		}
-		for (j = 0; j < MAX_INDIRECT_PAGES; j++) {
-			if (!req->segments[j])
-				break;
-			kfree(req->indirect_pages[j]);
-		}
-		kfree(req);
-		i++;
+		WARN_ON(i != XEN_BLKIF_REQS);
 	}
-	WARN_ON(i != XEN_BLKIF_REQS);
 
 	kfree(blkif->rings);
 

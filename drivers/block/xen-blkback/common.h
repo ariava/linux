@@ -288,6 +288,12 @@ struct xen_blkif_ring {
 
 	struct list_head	free_pages;
 
+	/* List of all 'pending_req' available */
+	struct list_head	pending_free;
+	/* And its spinlock. */
+	spinlock_t		pending_free_lock;
+	wait_queue_head_t	pending_free_wq;
+
 	struct xen_blkif	*blkif;
 	unsigned		ring_index;
 };
@@ -308,12 +314,6 @@ struct xen_blkif {
 	/* Private fields. */
 	spinlock_t		blk_ring_lock;
 	atomic_t		refcnt;
-
-	/* List of all 'pending_req' available */
-	struct list_head	pending_free;
-	/* And its spinlock. */
-	spinlock_t		pending_free_lock;
-	wait_queue_head_t	pending_free_wq;
 
 	/* for barrier (drain) requests */
 	struct completion	drain_complete;
