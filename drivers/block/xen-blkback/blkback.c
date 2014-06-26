@@ -1358,7 +1358,7 @@ static void make_response(struct xen_blkif_ring *ring, u64 id,
 	resp.operation = op;
 	resp.status    = st;
 
-	spin_lock_irqsave(&blkif->blk_ring_lock, flags);
+	spin_lock_irqsave(&ring->blk_ring_lock, flags);
 	/* Place on the response ring for the relevant domain. */
 	switch (blkif->blk_protocol) {
 	case BLKIF_PROTOCOL_NATIVE:
@@ -1378,7 +1378,7 @@ static void make_response(struct xen_blkif_ring *ring, u64 id,
 	}
 	blk_rings->common.rsp_prod_pvt++;
 	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&blk_rings->common, notify);
-	spin_unlock_irqrestore(&blkif->blk_ring_lock, flags);
+	spin_unlock_irqrestore(&ring->blk_ring_lock, flags);
 	if (notify)
 		notify_remote_via_irq(ring->irq);
 }

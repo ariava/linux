@@ -133,6 +133,8 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 	for (r = 0 ; r < nr_rings ; r++) {
 		struct xen_blkif_ring *ring = &rings[r];
 
+		spin_lock_init(&ring->blk_ring_lock);
+
 		init_waitqueue_head(&ring->wq);
 		init_waitqueue_head(&ring->waiting_to_free);
 		init_waitqueue_head(&ring->shutdown_wq);
@@ -191,7 +193,6 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 		return ERR_PTR(-ENOMEM);
 
 	blkif->domid = domid;
-	spin_lock_init(&blkif->blk_ring_lock);
 	atomic_set(&blkif->refcnt, 1);
 	atomic_set(&blkif->drain, 0);
 	init_completion(&blkif->drain_complete);

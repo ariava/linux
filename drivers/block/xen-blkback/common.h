@@ -267,6 +267,7 @@ struct xen_blkif_ring {
 	struct task_struct	*xenblkd;
 	unsigned int		waiting_reqs;
 	void			*blk_ring;
+	spinlock_t		blk_ring_lock;
 
 	wait_queue_head_t	waiting_to_free;
 	/* Thread shutdown wait queue. */
@@ -312,7 +313,6 @@ struct xen_blkif {
 	/* Back pointer to the backend_info. */
 	struct backend_info	*be;
 	/* Private fields. */
-	spinlock_t		blk_ring_lock;
 	atomic_t		refcnt;
 
 	/* for barrier (drain) requests */
