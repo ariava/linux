@@ -171,6 +171,9 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 
 		ring->blkif = blkif;
 		ring->ring_index = r;
+
+		spin_lock_init(&ring->stats_lock);
+		ring->st_print = jiffies;
 	}
 
 	blkif->allocated_rings = nr_rings;
@@ -197,7 +200,6 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 	atomic_set(&blkif->drain, 0);
 	init_completion(&blkif->drain_complete);
 	atomic_set(&blkif->inflight, 0);
-	blkif->st_print = jiffies;
 
 	return blkif;
 }
@@ -358,6 +360,29 @@ int __init xen_blkif_interface_init(void)
 	{								\
 		struct xenbus_device *dev = to_xenbus_device(_dev);	\
 		struct backend_info *be = dev_get_drvdata(&dev->dev);	\
+		struct xen_blkif *blkif = be->blkif;			\
+		struct xen_blkif_ring *ring;				\
+		int i;							\
+									\
+		blkif->st_oo_req = 0;					\
+		blkif->st_rd_req = 0;					\
+		blkif->st_wr_req = 0;					\
+		blkif->st_f_req = 0;					\
+		blkif->st_ds_req = 0;					\
+		blkif->st_rd_sect = 0;					\
+		blkif->st_wr_sect = 0;					\
+		for (i = 0 ; i < blkif->allocated_rings ; i++) {	\
+			ring = &blkif->rings[i];			\
+			spin_lock_irq(&ring->stats_lock);		\
+			blkif->st_oo_req += ring->st_oo_req;		\
+			blkif->st_rd_req += ring->st_rd_req;		\
+			blkif->st_wr_req += ring->st_wr_req;		\
+			blkif->st_f_req += ring->st_f_req;		\
+			blkif->st_ds_req += ring->st_ds_req;		\
+			blkif->st_rd_sect += ring->st_rd_sect;		\
+			blkif->st_wr_sect += ring->st_wr_sect;		\
+			spin_unlock_irq(&ring->stats_lock);		\
+		}							\
 									\
 		return sprintf(buf, format, ##args);			\
 	}								\

@@ -297,6 +297,17 @@ struct xen_blkif_ring {
 
 	struct xen_blkif	*blkif;
 	unsigned		ring_index;
+
+	spinlock_t		stats_lock;
+	/* statistics */
+	unsigned long		st_print;
+	unsigned long long	st_rd_req;
+	unsigned long long	st_wr_req;
+	unsigned long long	st_oo_req;
+	unsigned long long	st_f_req;
+	unsigned long long	st_ds_req;
+	unsigned long long	st_rd_sect;
+	unsigned long long	st_wr_sect;
 };
 
 struct xen_blkif {
@@ -321,14 +332,13 @@ struct xen_blkif {
 	atomic_t		inflight;
 
 	/* statistics */
-	unsigned long		st_print;
-	unsigned long long			st_rd_req;
-	unsigned long long			st_wr_req;
-	unsigned long long			st_oo_req;
-	unsigned long long			st_f_req;
-	unsigned long long			st_ds_req;
-	unsigned long long			st_rd_sect;
-	unsigned long long			st_wr_sect;
+	unsigned long long	st_rd_req;
+	unsigned long long	st_wr_req;
+	unsigned long long	st_oo_req;
+	unsigned long long	st_f_req;
+	unsigned long long	st_ds_req;
+	unsigned long long	st_rd_sect;
+	unsigned long long	st_wr_sect;
 };
 
 struct seg_buf {
