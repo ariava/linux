@@ -247,6 +247,8 @@ struct backend_info;
 
 /* Number of requests that we can fit in a ring */
 #define XEN_BLKIF_REQS			32
+#define XEN_RING_REQS(nr_rings)		((XEN_BLKIF_REQS / nr_rings > 4) ? \
+						XEN_BLKIF_REQS / nr_rings : 4)
 
 struct persistent_gnt {
 	struct page *page;

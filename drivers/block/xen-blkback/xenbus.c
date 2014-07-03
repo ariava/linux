@@ -149,7 +149,7 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 		spin_lock_init(&ring->pending_free_lock);
 		init_waitqueue_head(&ring->pending_free_wq);
 		INIT_LIST_HEAD(&ring->pending_free);
-		for (i = 0; i < XEN_BLKIF_REQS; i++) {
+		for (i = 0; i < XEN_RING_REQS(nr_rings); i++) {
 			req = kzalloc(sizeof(*req), GFP_KERNEL);
 			if (!req)
 				goto fail;

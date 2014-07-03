@@ -75,6 +75,8 @@ MODULE_PARM_DESC(max_buffer_pages,
  * algorithm.
  */
 
+#define XEN_RING_MAX_PGRANTS(nr_rings)	((xen_blkif_max_pgrants / nr_rings > 16) ? \
+						xen_blkif_max_pgrants / nr_rings : 16)
 static int xen_blkif_max_pgrants = 1056;
 module_param_named(max_persistent_grants, xen_blkif_max_pgrants, int, 0644);
 MODULE_PARM_DESC(max_persistent_grants,
@@ -195,7 +197,8 @@ static int add_persistent_gnt(struct xen_blkif_ring *ring,
 	struct rb_node **new = NULL, *parent = NULL;
 	struct persistent_gnt *this;
 
-	if (ring->persistent_gnt_c >= xen_blkif_max_pgrants) {
+	if (ring->persistent_gnt_c >=
+		XEN_RING_MAX_PGRANTS(ring->blkif->allocated_rings)) {
 		if (!blkif->vbd.overflow_max_grants)
 			blkif->vbd.overflow_max_grants = 1;
 		return -EBUSY;
@@ -345,9 +348,10 @@ static void purge_persistent_gnt(struct xen_blkif_ring *ring)
 	unsigned int num_clean, total;
 	bool scan_used = false, clean_used = false;
 	struct rb_root *root;
+	unsigned nr_rings = ring->blkif->allocated_rings;
 
-	if (ring->persistent_gnt_c < xen_blkif_max_pgrants ||
-	    (ring->persistent_gnt_c == xen_blkif_max_pgrants &&
+	if (ring->persistent_gnt_c < XEN_RING_MAX_PGRANTS(nr_rings) ||
+	    (ring->persistent_gnt_c == XEN_RING_MAX_PGRANTS(nr_rings) &&
 	    !blkif->vbd.overflow_max_grants)) {
 		return;
 	}
@@ -357,8 +361,8 @@ static void purge_persistent_gnt(struct xen_blkif_ring *ring)
 		return;
 	}
 
-	num_clean = (xen_blkif_max_pgrants / 100) * LRU_PERCENT_CLEAN;
-	num_clean = ring->persistent_gnt_c - xen_blkif_max_pgrants + num_clean;
+	num_clean = (XEN_RING_MAX_PGRANTS(nr_rings) / 100) * LRU_PERCENT_CLEAN;
+	num_clean = ring->persistent_gnt_c - XEN_RING_MAX_PGRANTS(nr_rings) + num_clean;
 	num_clean = min(ring->persistent_gnt_c, num_clean);
 	if ((num_clean == 0) ||
 	    (num_clean > (ring->persistent_gnt_c - atomic_read(&ring->persistent_gnt_in_use))))
@@ -564,7 +568,7 @@ static void print_stats(struct xen_blkif_ring *ring)
 		 ring->st_rd_req, ring->st_wr_req,
 		 ring->st_f_req, ring->st_ds_req,
 		 ring->persistent_gnt_c,
-		 xen_blkif_max_pgrants);
+		 XEN_RING_MAX_PGRANTS(ring->blkif->allocated_rings));
 	ring->st_print = jiffies + msecs_to_jiffies(10 * 1000);
 	ring->st_rd_req = 0;
 	ring->st_wr_req = 0;
@@ -778,7 +782,8 @@ again:
 			continue;
 		}
 		if (use_persistent_gnts &&
-		    ring->persistent_gnt_c < xen_blkif_max_pgrants) {
+		    ring->persistent_gnt_c <
+			XEN_RING_MAX_PGRANTS(ring->blkif->allocated_rings)) {
 			/*
 			 * We are using persistent grants, the grant is
 			 * not mapped but we might have room for it.
@@ -805,7 +810,7 @@ again:
 			pages[seg_idx]->persistent_gnt = persistent_gnt;
 			pr_debug(DRV_PFX " grant %u added to the tree of persistent grants, using %u/%u\n",
 				 persistent_gnt->gnt, ring->persistent_gnt_c,
-				 xen_blkif_max_pgrants);
+				 XEN_RING_MAX_PGRANTS(ring->blkif->allocated_rings));
 			goto next;
 		}
 		if (use_persistent_gnts && !blkif->vbd.overflow_max_grants) {
