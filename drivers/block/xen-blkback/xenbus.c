@@ -270,13 +270,19 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 
 	for (i = 0 ; i < blkif->allocated_rings ; i++) {
 		struct xen_blkif_ring *ring = &blkif->rings[i];
+		int ref_counter;
+
 		if (ring->xenblkd) {
 			kthread_stop(ring->xenblkd);
 			wake_up(&ring->shutdown_wq);
 			ring->xenblkd = NULL;
-		}
+			ref_counter = blkif->allocated_rings - (i + 1);
+		} else
+			/* Only the reference taken by the driver is left */
+			ref_counter = 0;
+		BUG_ON(ref_counter < 0);
 		atomic_dec(&blkif->refcnt);
-		wait_event(ring->waiting_to_free, atomic_read(&blkif->refcnt) == 0);
+		wait_event(ring->waiting_to_free, atomic_read(&blkif->refcnt) == ref_counter);
 		atomic_inc(&blkif->refcnt);
 
 		if (ring->irq) {
@@ -330,7 +336,8 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 			kfree(req);
 			i++;
 		}
-		WARN_ON(i != XEN_BLKIF_REQS);
+		/* XXX restore WARN_ON as soon as switching to per-ring pools */
+		/* WARN_ON(i != XEN_BLKIF_REQS); */
 	}
 
 	kfree(blkif->rings);
