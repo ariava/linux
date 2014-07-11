@@ -978,19 +978,20 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 			GFP_KERNEL);
 	if (!flags)
 		return;
-	for (i = 0 ; i < info->nr_rings ; i++)
-		spin_lock_irqsave(&info->rinfo[i].io_lock, flags[i]);
 
-	/* No more blkif_request(). */
-	if (info->nr_hw_queues == 0)
+	/* No more blkif_request() and no more gnttab callback work. */
+	if (info->nr_hw_queues == 0) {
+		spin_lock_irqsave(&info->rinfo[0].io_lock, flags[0]);
 		blk_stop_queue(info->rq);
-	else
+		gnttab_cancel_free_callback(&info->rinfo[0].callback);
+		spin_unlock_irqrestore(&info->rinfo[0].io_lock, flags[0]);
+	} else {
 		blk_mq_stop_hw_queues(info->rq);
-
-	/* No more gnttab callback work. */
-	for (i = 0 ; i < info->nr_rings ; i++) {
-		gnttab_cancel_free_callback(&info->rinfo[i].callback);
-		spin_unlock_irqrestore(&info->rinfo[i].io_lock, flags[i]);
+		for (i = 0 ; i < info->nr_rings ; i++) {
+			spin_lock_irqsave(&info->rinfo[i].io_lock, flags[i]);
+			gnttab_cancel_free_callback(&info->rinfo[i].callback);
+			spin_unlock_irqrestore(&info->rinfo[i].io_lock, flags[i]);
+		}
 	}
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
@@ -1107,57 +1108,57 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 	struct grant *n;
 	int i;
 
-	/* Prevent new requests being issued until we fix things up. */
-	for (i = 0 ; i < info->nr_rings ; i++)
-		spin_lock_irq(&info->rinfo[i].io_lock);
 	info->connected = suspend ?
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
-	/* No more blkif_request(). */
-	if (info->rq) {
-		if (info->nr_hw_queues == 0)
-			blk_stop_queue(info->rq);
-		else
-			blk_mq_stop_hw_queues(info->rq);
-	}
 
-	for (i = 0 ; i < info->nr_rings ; i++) {
-		struct blkfront_ring_info *rinfo = &info->rinfo[i];
-		/* Remove all persistent grants */
-		if (!list_empty(&rinfo->grants)) {
-			list_for_each_entry_safe(persistent_gnt, n,
-			                         &rinfo->grants, node) {
-				list_del(&persistent_gnt->node);
-				if (persistent_gnt->gref != GRANT_INVALID_REF) {
-					gnttab_end_foreign_access(persistent_gnt->gref,
-					                          0, 0UL);
-					rinfo->persistent_gnts_c--;
+	/* Prevent new requests being issued until we fix things up. */
+	/* No more blkif_request() and no more gnttab callback work. */
+	if (info->nr_hw_queues == 0 && info->rq) {
+		spin_lock_irq(&info->rinfo[0].io_lock);
+		blk_stop_queue(info->rq);
+		gnttab_cancel_free_callback(&info->rinfo[0].callback);
+		spin_unlock_irq(&info->rinfo[0].io_lock);
+	} else {
+		blk_mq_stop_hw_queues(info->rq);
+
+		for (i = 0 ; i < info->nr_rings ; i++) {
+			struct blkfront_ring_info *rinfo = &info->rinfo[i];
+
+			spin_lock_irq(&info->rinfo[i].io_lock);
+			/* Remove all persistent grants */
+			if (!list_empty(&rinfo->grants)) {
+				list_for_each_entry_safe(persistent_gnt, n,
+				                         &rinfo->grants, node) {
+					list_del(&persistent_gnt->node);
+					if (persistent_gnt->gref != GRANT_INVALID_REF) {
+						gnttab_end_foreign_access(persistent_gnt->gref,
+						                          0, 0UL);
+						rinfo->persistent_gnts_c--;
+					}
+					if (info->feature_persistent)
+						__free_page(pfn_to_page(persistent_gnt->pfn));
+					kfree(persistent_gnt);
 				}
-				if (info->feature_persistent)
-					__free_page(pfn_to_page(persistent_gnt->pfn));
-				kfree(persistent_gnt);
 			}
-		}
-		BUG_ON(rinfo->persistent_gnts_c != 0);
+			BUG_ON(rinfo->persistent_gnts_c != 0);
 
-		/*
-		 * Remove indirect pages, this only happens when using indirect
-		 * descriptors but not persistent grants
-		 */
-		if (!list_empty(&rinfo->indirect_pages)) {
-			struct page *indirect_page, *n;
+			/*
+			 * Remove indirect pages, this only happens when using indirect
+			 * descriptors but not persistent grants
+			 */
+			if (!list_empty(&rinfo->indirect_pages)) {
+				struct page *indirect_page, *n;
 
-			BUG_ON(info->feature_persistent);
-			list_for_each_entry_safe(indirect_page, n, &rinfo->indirect_pages, lru) {
-				list_del(&indirect_page->lru);
-				__free_page(indirect_page);
+				BUG_ON(info->feature_persistent);
+				list_for_each_entry_safe(indirect_page, n, &rinfo->indirect_pages, lru) {
+					list_del(&indirect_page->lru);
+					__free_page(indirect_page);
+				}
 			}
+
+			blkif_free_ring(&info->rinfo[i], info->feature_persistent);
 		}
 
-		blkif_free_ring(&info->rinfo[i], info->feature_persistent);
-	}
-
-	/* No more gnttab callback work. */
-	for (i = 0 ; i < info->nr_rings ; i++) {
 		gnttab_cancel_free_callback(&info->rinfo[i].callback);
 		spin_unlock_irq(&info->rinfo[i].io_lock);
 	}
@@ -1734,30 +1735,29 @@ static int blkif_recover(struct blkfront_info *info)
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
-	for (i = 0 ; i < info->nr_rings ; i++)
-		spin_lock_irq(&info->rinfo[i].io_lock);
-
 	/* Now safe for us to use the shared ring */
 	info->connected = BLKIF_STATE_CONNECTED;
 
-	/* Kick any other new requests queued since we resumed */
-	for (i = 0 ; i < info->nr_rings ; i++)
+	for (i = 0 ; i < info->nr_rings ; i++) {
+		spin_lock_irq(&info->rinfo[i].io_lock);
+
+		/* Kick any other new requests queued since we resumed */
 		kick_pending_request_queues(&info->rinfo[i]);
 
-	/*
-	 * XXX this is most certainly buggy: we are in fact expected
-	 *     to handle requests queued in hctxs; also note, in case
-	 *     feature_multiqueue is enabled here requests is empty
-	 */
-	list_for_each_entry_safe(req, n, &requests, queuelist) {
-		/* Requeue pending requests (flush or discard) */
-		list_del_init(&req->queuelist);
-		BUG_ON(req->nr_phys_segments > segs);
-		blk_requeue_request(info->rq, req);
-	}
+		/*
+		 * XXX this is most certainly buggy: we are in fact expected
+		 *     to handle requests queued in hctxs; also note, in case
+		 *     feature_multiqueue is enabled here requests is empty
+		 */
+		list_for_each_entry_safe(req, n, &requests, queuelist) {
+			/* Requeue pending requests (flush or discard) */
+			list_del_init(&req->queuelist);
+			BUG_ON(req->nr_phys_segments > segs);
+			blk_requeue_request(info->rq, req);
+		}
 
-	for (i = 0 ; i < info->nr_rings ; i++)
 		spin_unlock_irq(&info->rinfo[i].io_lock);
+	}
 
 	while ((bio = bio_list_pop(&bio_list)) != NULL) {
 		/* Traverse the list of pending bios and re-queue them */
@@ -2117,11 +2117,10 @@ static void blkfront_connect(struct blkfront_info *info)
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
-	/* Kick pending requests. */
-	for (i = 0 ; i < info->nr_rings ; i++)
-		spin_lock_irq(&info->rinfo[i].io_lock);
 	info->connected = BLKIF_STATE_CONNECTED;
+	/* Kick pending requests. */
 	for (i = 0 ; i < info->nr_rings ; i++) {
+		spin_lock_irq(&info->rinfo[i].io_lock);
 		kick_pending_request_queues(&info->rinfo[i]);
 		spin_unlock_irq(&info->rinfo[i].io_lock);
 	}
