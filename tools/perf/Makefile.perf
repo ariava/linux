@@ -468,6 +468,8 @@ ifneq ($(OUTPUT),)
   CFLAGS += -I$(OUTPUT)
 endif
 
+CFLAGS += -lz
+
 ifdef NO_LIBELF
 EXTLIBS := $(filter-out -lelf,$(EXTLIBS))
 

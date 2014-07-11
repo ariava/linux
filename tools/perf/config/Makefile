@@ -241,11 +241,11 @@ ifeq ($(feature-stackprotector-all), 1)
   CFLAGS += -fstack-protector-all
 endif
 
-ifeq ($(DEBUG),0)
-  ifeq ($(feature-fortify-source), 1)
-    CFLAGS += -D_FORTIFY_SOURCE=2
-  endif
-endif
+#ifeq ($(DEBUG),0)
+#  ifeq ($(feature-fortify-source), 1)
+#    CFLAGS += -D_FORTIFY_SOURCE=2
+#  endif
+#endif
 
 CFLAGS += -I$(src-perf)/util/include
 CFLAGS += -I$(src-perf)/arch/$(ARCH)/include
