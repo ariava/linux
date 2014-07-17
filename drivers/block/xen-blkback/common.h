@@ -296,6 +296,10 @@ struct xen_blkif_ring {
 	/* And its spinlock. */
 	spinlock_t		pending_free_lock;
 	wait_queue_head_t	pending_free_wq;
+	atomic_t		inflight;
+
+	/* Private fields. */
+	atomic_t		refcnt;
 
 	struct xen_blkif	*blkif;
 	unsigned		ring_index;
@@ -325,13 +329,10 @@ struct xen_blkif {
 	unsigned int		allocated_rings;
 	/* Back pointer to the backend_info. */
 	struct backend_info	*be;
-	/* Private fields. */
-	atomic_t		refcnt;
 
 	/* for barrier (drain) requests */
 	struct completion	drain_complete;
 	atomic_t		drain;
-	atomic_t		inflight;
 
 	/* statistics */
 	unsigned long long	st_rd_req;
@@ -382,10 +383,10 @@ struct pending_req {
 			  get_capacity((_v)->bdev->bd_disk))
 
 #define xen_blkif_get(_b) (atomic_inc(&(_b)->refcnt))
-#define xen_blkif_put(_b, _c)				\
+#define xen_blkif_put(_b)				\
 	do {						\
 		if (atomic_dec_and_test(&(_b)->refcnt))	\
-			wake_up(&(_c)->waiting_to_free);\
+			wake_up(&(_b)->waiting_to_free);\
 	} while (0)
 
 struct phys_req {

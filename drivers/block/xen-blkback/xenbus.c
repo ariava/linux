@@ -145,6 +145,8 @@ static struct xen_blkif_ring *xen_blkif_ring_alloc(struct xen_blkif *blkif,
 		INIT_LIST_HEAD(&ring->persistent_purge_list);
 		ring->free_pages_num = 0;
 		atomic_set(&ring->persistent_gnt_in_use, 0);
+		atomic_set(&ring->refcnt, 1);
+		atomic_set(&ring->inflight, 0);
 		INIT_WORK(&ring->persistent_purge_work, xen_blkbk_unmap_purged_grants);
 		spin_lock_init(&ring->pending_free_lock);
 		init_waitqueue_head(&ring->pending_free_wq);
@@ -196,10 +198,8 @@ static struct xen_blkif *xen_blkif_alloc(domid_t domid)
 		return ERR_PTR(-ENOMEM);
 
 	blkif->domid = domid;
-	atomic_set(&blkif->refcnt, 1);
 	atomic_set(&blkif->drain, 0);
 	init_completion(&blkif->drain_complete);
-	atomic_set(&blkif->inflight, 0);
 
 	return blkif;
 }
@@ -270,20 +270,15 @@ static void xen_blkif_disconnect(struct xen_blkif *blkif)
 
 	for (i = 0 ; i < blkif->allocated_rings ; i++) {
 		struct xen_blkif_ring *ring = &blkif->rings[i];
-		int ref_counter;
 
 		if (ring->xenblkd) {
 			kthread_stop(ring->xenblkd);
 			wake_up(&ring->shutdown_wq);
 			ring->xenblkd = NULL;
-			ref_counter = blkif->allocated_rings - (i + 1);
-		} else
-			/* Only the reference taken by the driver is left */
-			ref_counter = 0;
-		BUG_ON(ref_counter < 0);
-		atomic_dec(&blkif->refcnt);
-		wait_event(ring->waiting_to_free, atomic_read(&blkif->refcnt) == ref_counter);
-		atomic_inc(&blkif->refcnt);
+		}
+		atomic_dec(&ring->refcnt);
+		wait_event(ring->waiting_to_free, atomic_read(&ring->refcnt) == 0);
+		atomic_inc(&ring->refcnt);
 
 		if (ring->irq) {
 			unbind_from_irqhandler(ring->irq, ring);
@@ -302,11 +297,11 @@ static void xen_blkif_free(struct xen_blkif *blkif)
 	struct pending_req *req, *n;
 	int i, j, r;
 
-	if (!atomic_dec_and_test(&blkif->refcnt))
-		BUG();
-
 	for (r = 0 ; r < blkif->allocated_rings ; r++) {
 		struct xen_blkif_ring *ring = &blkif->rings[r];
+
+		if (!atomic_dec_and_test(&ring->refcnt))
+			BUG();
 
 		/* Remove all persistent grants and the cache of ballooned pages. */
 		xen_blkbk_free_caches(ring);

@@ -585,7 +585,7 @@ int xen_blkif_schedule(void *arg)
 	unsigned long timeout;
 	int ret;
 
-	xen_blkif_get(blkif);
+	xen_blkif_get(ring);
 
 	while (!kthread_should_stop()) {
 		if (try_to_freeze())
@@ -640,7 +640,7 @@ purge_gnt_list:
 		print_stats(ring);
 
 	ring->xenblkd = NULL;
-	xen_blkif_put(blkif, ring);
+	xen_blkif_put(ring);
 
 	return 0;
 }
@@ -907,7 +907,7 @@ static int dispatch_discard_io(struct xen_blkif_ring *ring,
 	unsigned long secure;
 	struct phys_req preq;
 
-	xen_blkif_get(blkif);
+	xen_blkif_get(ring);
 
 	preq.sector_number = req->u.discard.sector_number;
 	preq.nr_sects      = req->u.discard.nr_sectors;
@@ -938,7 +938,7 @@ fail_response:
 		status = BLKIF_RSP_ERROR;
 
 	make_response(ring, req->u.discard.id, req->operation, status);
-	xen_blkif_put(blkif, ring);
+	xen_blkif_put(ring);
 	return err;
 }
 
@@ -952,11 +952,12 @@ static int dispatch_other_io(struct xen_blkif_ring *ring,
 	return -EIO;
 }
 
-static void xen_blk_drain_io(struct xen_blkif *blkif)
+static void xen_blk_drain_io(struct xen_blkif_ring *ring)
 {
+	struct xen_blkif *blkif = ring->blkif;
 	atomic_set(&blkif->drain, 1);
 	do {
-		if (atomic_read(&blkif->inflight) == 0)
+		if (atomic_read(&ring->inflight) == 0)
 			break;
 		wait_for_completion_interruptible_timeout(
 				&blkif->drain_complete, HZ);
@@ -1017,10 +1018,10 @@ static void __end_block_io_op(struct pending_req *pending_req, int error)
 		 * pending_free_wq if there's a drain going on, but it has
 		 * to be taken into account if the current model is changed.
 		 */
-		if (atomic_dec_and_test(&blkif->inflight) && atomic_read(&blkif->drain)) {
+		if (atomic_dec_and_test(&ring->inflight) && atomic_read(&blkif->drain)) {
 			complete(&blkif->drain_complete);
 		}
-		xen_blkif_put(blkif, ring);
+		xen_blkif_put(ring);
 	}
 }
 
@@ -1280,8 +1281,8 @@ static int dispatch_rw_block_io(struct xen_blkif_ring *ring,
 	 * This corresponding xen_blkif_put is done in __end_block_io_op, or
 	 * below (in "!bio") if we are handling a BLKIF_OP_DISCARD.
 	 */
-	xen_blkif_get(blkif);
-	atomic_inc(&blkif->inflight);
+	xen_blkif_get(ring);
+	atomic_inc(&ring->inflight);
 
 	for (i = 0; i < nseg; i++) {
 		while ((bio == NULL) ||
