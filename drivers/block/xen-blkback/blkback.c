@@ -1266,7 +1266,7 @@ static int dispatch_rw_block_io(struct xen_blkif_ring *ring,
 	 * issue the WRITE_FLUSH.
 	 */
 	if (drain)
-		xen_blk_drain_io(pending_req->ring->blkif);
+		xen_blk_drain_io(pending_req->ring);
 
 	/*
 	 * If we have failed at this point, we need to undo the M2P override,
