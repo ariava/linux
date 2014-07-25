@@ -1661,7 +1661,7 @@ static int blkif_recover(struct blkfront_info *info)
 	struct blk_shadow *copy;
 	int rc = 0;
 	struct bio *bio, *cloned_bio;
-	struct bio_list bio_list, merge_bio;
+	struct bio_list uninitialized_var(bio_list), merge_bio;
 	unsigned int segs, offset;
 	int pending, size;
 	struct split_bio *split_bio;
