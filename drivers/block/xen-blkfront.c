@@ -101,6 +101,10 @@ static unsigned int xen_blkif_max_segments = 32;
 module_param_named(max, xen_blkif_max_segments, int, S_IRUGO);
 MODULE_PARM_DESC(max, "Maximum amount of segments in indirect requests (default is 32)");
 
+static unsigned int xen_force_mq = 1;
+module_param_named(force_mq, xen_force_mq, int, S_IRUGO);
+MODULE_PARM_DESC(force_mq, "Force the use of blk-mq if the backend is non-mq-ready");
+
 #define BLK_RING_SIZE __CONST_RING_SIZE(blkif, PAGE_SIZE)
 
 struct blkfront_ring_info
@@ -1442,7 +1446,7 @@ again:
 	}
 
 	for (i = 0 ; i < info->nr_rings ; i++) {
-		if (info->nr_hw_queues == 0) {
+		if (info->nr_hw_queues == 0 || xen_force_mq) {
 			BUG_ON(i > 0);
 			/* Support old XenStore keys */
 			snprintf(ring_ref_s, 64, "ring-ref");
@@ -1573,11 +1577,16 @@ static int blkfront_probe(struct xenbus_device *dev,
 	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
 			    "nr_supported_hw_queues", "%u", &nr_queues,
 			    NULL);
-	if (err)
-		info->nr_hw_queues = 0;
-	else
+	if (err) {
+		if (xen_force_mq)
+			info->nr_hw_queues = 1;
+		else
+			info->nr_hw_queues = 0;
+	} else {
 		info->nr_hw_queues = nr_queues;
-	printk(KERN_CRIT "XEN blkfront_probe nr_hw_queues %u\n", info->nr_hw_queues);
+		xen_force_mq = 0;
+	}
+	printk(KERN_CRIT "XEN blkfront_probe nr_hw_queues %u, force %d\n", info->nr_hw_queues, xen_force_mq);
 	if (info->nr_hw_queues > 0) { /* supports multiqueue */
 		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
 		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
