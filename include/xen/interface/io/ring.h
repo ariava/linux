@@ -78,8 +78,8 @@ union __name##_sring_entry {						\
 									\
 /* Shared ring page */							\
 struct __name##_sring {							\
-    RING_IDX req_prod, req_event;					\
-    RING_IDX rsp_prod, rsp_event;					\
+    RING_IDX req_prod, req_cons, req_event;				\
+    RING_IDX rsp_prod, rsp_cons, rsp_event;				\
     uint8_t  pad[48];							\
     union __name##_sring_entry ring[1]; /* variable-length */		\
 };									\
@@ -117,21 +117,20 @@ struct __name##_back_ring {						\
 
 /* Initialising empty rings */
 #define SHARED_RING_INIT(_s) do {					\
-    (_s)->req_prod  = (_s)->rsp_prod  = 0;				\
+    (_s)->req_prod  = (_s)->req_cons = (_s)->rsp_cons =			\
+		      (_s)->rsp_prod  = 0;				\
     (_s)->req_event = (_s)->rsp_event = 1;				\
     memset((_s)->pad, 0, sizeof((_s)->pad));				\
 } while(0)
 
 #define FRONT_RING_INIT(_r, _s, __size) do {				\
     (_r)->req_prod_pvt = 0;						\
-    (_r)->rsp_cons = 0;							\
     (_r)->nr_ents = __RING_SIZE(_s, __size);				\
     (_r)->sring = (_s);							\
 } while (0)
 
 #define BACK_RING_INIT(_r, _s, __size) do {				\
     (_r)->rsp_prod_pvt = 0;						\
-    (_r)->req_cons = 0;							\
     (_r)->nr_ents = __RING_SIZE(_s, __size);				\
     (_r)->sring = (_s);							\
 } while (0)
@@ -147,7 +146,7 @@ struct __name##_back_ring {						\
 #define BACK_RING_ATTACH(_r, _s, __size) do {				\
     (_r)->sring = (_s);							\
     (_r)->rsp_prod_pvt = (_s)->rsp_prod;				\
-    (_r)->req_cons = (_s)->req_prod;					\
+    (_r)->sring->req_cons = (_s)->req_prod;				\
     (_r)->nr_ents = __RING_SIZE(_s, __size);				\
 } while (0)
 
@@ -158,22 +157,36 @@ struct __name##_back_ring {						\
 /* Number of free requests (for use on front side only). */
 #define RING_FREE_REQUESTS(_r)						\
     (RING_SIZE(_r) - ((_r)->req_prod_pvt - (_r)->rsp_cons))
+#define RING_FREE_REQUESTS_BLK(_rq, _rs)				\
+    (RING_SIZE(_rq) - ((_rq)->req_prod_pvt - (_rs)->sring->rsp_cons))
+
+#define RING_REQ_PROD_FREE_REQUESTS(_r)					\
+    (RING_SIZE(_r) - (_r)->req_prod_pvt)
+
+#define RING_RSP_CONS_FREE_REQUESTS(_r)					\
+    (RING_SIZE(_r) - (_r)->rsp_cons)
 
 /* Test if there is an empty slot available on the front ring.
  * (This is only meaningful from the front. )
  */
 #define RING_FULL(_r)							\
     (RING_FREE_REQUESTS(_r) == 0)
+#define RING_FULL_BLK(_rq, _rs)						\
+    (RING_FREE_REQUESTS_BLK(_rq, _rs) == 0)
 
 /* Test if there are outstanding messages to be processed on a ring. */
 #define RING_HAS_UNCONSUMED_RESPONSES(_r)				\
     ((_r)->sring->rsp_prod - (_r)->rsp_cons)
+#define RING_HAS_UNCONSUMED_RESPONSES_BLK(_r)				\
+    ((_r)->sring->rsp_prod - (_r)->sring->rsp_cons)
 
 #define RING_HAS_UNCONSUMED_REQUESTS(_r)				\
     ({									\
-	unsigned int req = (_r)->sring->req_prod - (_r)->req_cons;	\
+	unsigned int req = (_r)->sring->req_prod -			\
+			   (_r)->sring->req_cons;			\
 	unsigned int rsp = RING_SIZE(_r) -				\
-			   ((_r)->req_cons - (_r)->rsp_prod_pvt);	\
+			   ((_r)->sring->req_cons -			\
+			   (_r)->rsp_prod_pvt);				\
 	req < rsp ? req : rsp;						\
     })
 
@@ -256,7 +269,7 @@ struct __name##_back_ring {						\
 #define RING_FINAL_CHECK_FOR_REQUESTS(_r, _work_to_do) do {		\
     (_work_to_do) = RING_HAS_UNCONSUMED_REQUESTS(_r);			\
     if (_work_to_do) break;						\
-    (_r)->sring->req_event = (_r)->req_cons + 1;			\
+    (_r)->sring->req_event = (_r)->sring->req_cons + 1;			\
     mb();								\
     (_work_to_do) = RING_HAS_UNCONSUMED_REQUESTS(_r);			\
 } while (0)
@@ -267,6 +280,13 @@ struct __name##_back_ring {						\
     (_r)->sring->rsp_event = (_r)->rsp_cons + 1;			\
     mb();								\
     (_work_to_do) = RING_HAS_UNCONSUMED_RESPONSES(_r);			\
+} while (0)
+#define RING_FINAL_CHECK_FOR_RESPONSES_BLK(_r, _work_to_do) do {	\
+    (_work_to_do) = RING_HAS_UNCONSUMED_RESPONSES_BLK(_r);		\
+    if (_work_to_do) break;						\
+    (_r)->sring->rsp_event = (_r)->sring->rsp_cons + 1;			\
+    mb();								\
+    (_work_to_do) = RING_HAS_UNCONSUMED_RESPONSES_BLK(_r);		\
 } while (0)
 
 #endif /* __XEN_PUBLIC_IO_RING_H__ */
