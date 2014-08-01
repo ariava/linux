@@ -619,16 +619,17 @@ static int blkif_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 
 	pr_debug("Entered blkif_queue_rq\n");
 
+	spin_lock_irq(&rinfo->io_lock);
 	if (RING_FULL(&rinfo->ring))
 		goto wait;
 
 	if (blkif_request_flush_mismatch(req, info)) {
 		req->errors = -EIO;
 		blk_mq_complete_request(req);
+		spin_unlock_irq(&rinfo->io_lock);
 		return BLK_MQ_RQ_QUEUE_ERROR;
 	}
 
-	spin_lock_irq(&rinfo->io_lock);
 	if (blkif_queue_request(req, rinfo->hctx_index)) {
 wait:
 		/*
@@ -637,6 +638,7 @@ wait:
 		 * seeing the return value.
 		 */
 		blk_mq_stop_hw_queue(hctx);
+		spin_unlock_irq(&rinfo->io_lock);
 		return BLK_MQ_RQ_QUEUE_BUSY;
 	}
 
