@@ -1580,9 +1580,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 	printk(KERN_CRIT "XEN blkfront_probe nr_hw_queues %u\n", info->nr_hw_queues);
 	if (info->nr_hw_queues > 0) { /* supports multiqueue */
 		blkfront_mq_reg.nr_hw_queues = info->nr_hw_queues;
-		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
-					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
-					      BLK_RING_SIZE;
+		blkfront_mq_reg.queue_depth = BLK_RING_SIZE;
 	}
 	/*
 	 * The backend has told us the number of hw queues he wants.
