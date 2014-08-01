@@ -549,6 +549,12 @@ static void blkif_notify_work(struct xen_blkif_ring *ring)
 	wake_up(&ring->wq);
 }
 
+irqreturn_t xen_blkif_nop(int irq, void *dev_id)
+{
+        return IRQ_HANDLED;
+}
+
+
 irqreturn_t xen_blkif_be_int(int irq, void *dev_id)
 {
 	blkif_notify_work(dev_id);
@@ -1044,26 +1050,27 @@ static void end_block_io_op(struct bio *bio, int error)
 static int
 __do_block_io_op(struct xen_blkif_ring *ring)
 {
-	union blkif_back_rings *blk_rings = &ring->blk_rings;
+	union blkif_back_rings *rq_blk_rings = &ring->core.request_blk_rings;
+	union blkif_back_rings *rs_blk_rings = &ring->core.response_blk_rings;
 	struct xen_blkif *blkif = ring->blkif;
 	struct blkif_request req;
 	struct pending_req *pending_req;
 	RING_IDX rc, rp;
 	int more_to_do = 0;
 
-	rc = blk_rings->common.req_cons;
-	rp = blk_rings->common.sring->req_prod;
+	rc = rq_blk_rings->common.sring->req_cons;
+	rp = rq_blk_rings->common.sring->req_prod;
 	rmb(); /* Ensure we see queued requests up to 'rp'. */
 
-	if (RING_REQUEST_PROD_OVERFLOW(&blk_rings->common, rp)) {
-		rc = blk_rings->common.rsp_prod_pvt;
+	if (RING_REQUEST_PROD_OVERFLOW(&rs_blk_rings->common, rp)) {
+		rc = rs_blk_rings->common.rsp_prod_pvt;
 		pr_warn(DRV_PFX "Frontend provided bogus ring requests (%d - %d = %d). Halting ring processing on dev=%04x\n",
 			rp, rc, rp - rc, blkif->vbd.pdevice);
 		return -EACCES;
 	}
 	while (rc != rp) {
 
-		if (RING_REQUEST_CONS_OVERFLOW(&blk_rings->common, rc))
+		if (RING_REQUEST_CONS_OVERFLOW(&rs_blk_rings->common, rc))
 			break;
 
 		if (kthread_should_stop()) {
@@ -1082,18 +1089,18 @@ __do_block_io_op(struct xen_blkif_ring *ring)
 
 		switch (blkif->blk_protocol) {
 		case BLKIF_PROTOCOL_NATIVE:
-			memcpy(&req, RING_GET_REQUEST(&blk_rings->native, rc), sizeof(req));
+			memcpy(&req, RING_GET_REQUEST(&rq_blk_rings->native, rc), sizeof(req));
 			break;
 		case BLKIF_PROTOCOL_X86_32:
-			blkif_get_x86_32_req(&req, RING_GET_REQUEST(&blk_rings->x86_32, rc));
+			blkif_get_x86_32_req(&req, RING_GET_REQUEST(&rq_blk_rings->x86_32, rc));
 			break;
 		case BLKIF_PROTOCOL_X86_64:
-			blkif_get_x86_64_req(&req, RING_GET_REQUEST(&blk_rings->x86_64, rc));
+			blkif_get_x86_64_req(&req, RING_GET_REQUEST(&rq_blk_rings->x86_64, rc));
 			break;
 		default:
 			BUG();
 		}
-		blk_rings->common.req_cons = ++rc; /* before make_response() */
+		rq_blk_rings->common.sring->req_cons = ++rc; /* before make_response() */
 
 		/* Apply all sanity checks to /private copy/ of request. */
 		barrier();
@@ -1128,7 +1135,8 @@ done:
 static int
 do_block_io_op(struct xen_blkif_ring *ring)
 {
-	union blkif_back_rings *blk_rings = &ring->blk_rings;
+	union blkif_back_rings *rq_blk_rings = &ring->core.request_blk_rings;
+	union blkif_back_rings *rs_blk_rings = &ring->core.response_blk_rings;
 	int more_to_do;
 
 	do {
@@ -1136,7 +1144,7 @@ do_block_io_op(struct xen_blkif_ring *ring)
 		if (more_to_do)
 			break;
 
-		RING_FINAL_CHECK_FOR_REQUESTS(&blk_rings->common, more_to_do);
+		RING_FINAL_CHECK_FOR_REQUESTS_BLK(&rq_blk_rings->common, &rs_blk_rings->common, more_to_do);
 	} while (more_to_do);
 
 	return more_to_do;
@@ -1367,7 +1375,8 @@ static void make_response(struct xen_blkif_ring *ring, u64 id,
 {
 	struct blkif_response  resp;
 	unsigned long     flags;
-	union blkif_back_rings *blk_rings = &ring->blk_rings;
+	union blkif_back_rings *rsp_blk_rings = &ring->core.response_blk_rings;
+	//union blkif_back_rings *req_blk_rings = &ring->core.request_blk_rings;
 	struct xen_blkif *blkif = ring->blkif;
 	int notify;
 
@@ -1375,29 +1384,31 @@ static void make_response(struct xen_blkif_ring *ring, u64 id,
 	resp.operation = op;
 	resp.status    = st;
 
-	spin_lock_irqsave(&ring->blk_ring_lock, flags);
+	spin_lock_irqsave(&ring->core.request_blk_ring_lock, flags);
+	spin_lock(&ring->core.response_blk_ring_lock);
 	/* Place on the response ring for the relevant domain. */
 	switch (blkif->blk_protocol) {
 	case BLKIF_PROTOCOL_NATIVE:
-		memcpy(RING_GET_RESPONSE(&blk_rings->native, blk_rings->native.rsp_prod_pvt),
+		memcpy(RING_GET_RESPONSE(&rsp_blk_rings->native, rsp_blk_rings->native.rsp_prod_pvt),
 		       &resp, sizeof(resp));
 		break;
 	case BLKIF_PROTOCOL_X86_32:
-		memcpy(RING_GET_RESPONSE(&blk_rings->x86_32, blk_rings->x86_32.rsp_prod_pvt),
+		memcpy(RING_GET_RESPONSE(&rsp_blk_rings->x86_32, rsp_blk_rings->x86_32.rsp_prod_pvt),
 		       &resp, sizeof(resp));
 		break;
 	case BLKIF_PROTOCOL_X86_64:
-		memcpy(RING_GET_RESPONSE(&blk_rings->x86_64, blk_rings->x86_64.rsp_prod_pvt),
+		memcpy(RING_GET_RESPONSE(&rsp_blk_rings->x86_64, rsp_blk_rings->x86_64.rsp_prod_pvt),
 		       &resp, sizeof(resp));
 		break;
 	default:
 		BUG();
 	}
-	blk_rings->common.rsp_prod_pvt++;
-	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&blk_rings->common, notify);
-	spin_unlock_irqrestore(&ring->blk_ring_lock, flags);
+	rsp_blk_rings->common.rsp_prod_pvt++;
+	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&rsp_blk_rings->common, notify);
+	spin_unlock(&ring->core.response_blk_ring_lock);
+	spin_unlock_irqrestore(&ring->core.request_blk_ring_lock, flags);
 	if (notify)
-		notify_remote_via_irq(ring->irq);
+		notify_remote_via_irq(ring->core.response_irq);
 }
 
 static int __init xen_blkif_init(void)

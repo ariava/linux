@@ -259,17 +259,24 @@ struct persistent_gnt {
 	struct list_head remove_node;
 };
 
-struct xen_blkif_ring {
-	union blkif_back_rings	blk_rings;
+struct xen_blkif_ring_core {
 	/* Physical parameters of the comms window. */
-	unsigned int		irq;
+	union blkif_back_rings	request_blk_rings;
+	union blkif_back_rings	response_blk_rings;
+	void			*request_blk_ring;
+	void			*response_blk_ring;
+	unsigned int request_irq, response_irq;
+	spinlock_t		request_blk_ring_lock;
+	spinlock_t		response_blk_ring_lock;
+};
+
+struct xen_blkif_ring {
+	struct xen_blkif_ring_core core;
 
 	wait_queue_head_t	wq;
 	/* One thread per one blkif. */
 	struct task_struct	*xenblkd;
 	unsigned int		waiting_reqs;
-	void			*blk_ring;
-	spinlock_t		blk_ring_lock;
 
 	wait_queue_head_t	waiting_to_free;
 	/* Thread shutdown wait queue. */
