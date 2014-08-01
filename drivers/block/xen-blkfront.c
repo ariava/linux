@@ -723,7 +723,7 @@ static struct blk_mq_reg blkfront_mq_reg = {
 	.ops		= &blkfront_mq_ops,
 	/*
 	 * see blkfront_connect() for the initialization of
-	 * the following three fields
+	 * the following two fields
 	 */
 	.nr_hw_queues	= 0,
 	.queue_depth	= 0,
@@ -1583,8 +1583,6 @@ static int blkfront_probe(struct xenbus_device *dev,
 		blkfront_mq_reg.queue_depth = info->max_indirect_segments ?
 					      MAXIMUM_OUTSTANDING_BLOCK_REQS :
 					      BLK_RING_SIZE;
-		blkfront_mq_reg.cmd_size = max(sizeof(struct blkif_request),
-					sizeof(struct blkif_x86_64_request));
 	}
 	/*
 	 * The backend has told us the number of hw queues he wants.
