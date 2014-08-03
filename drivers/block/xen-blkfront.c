@@ -110,6 +110,7 @@ struct blkfront_ring_info
 	unsigned long shadow_free;
 
 	struct blkfront_info *info;
+	unsigned int hctx_index;
 };
 
 /*
@@ -659,12 +660,14 @@ wait:
 
 static int blkfront_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 {
-	struct blkfront_info *info = req->rq_disk->private_data;
+	struct blkfront_ring_info *rinfo =
+			(struct blkfront_ring_info *)hctx->driver_data;
+	struct blkfront_info *info = rinfo->info;
 
 	pr_debug("Entered blkfront_queue_rq\n");
 
 	spin_lock_irq(&info->io_lock);
-	if (RING_FULL(&info->rinfo[0].ring))
+	if (RING_FULL(&rinfo->ring))
 		goto wait;
 
 	if (blkif_request_flush_mismatch(req, info)) {
@@ -679,7 +682,7 @@ static int blkfront_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *req)
 			blk_rq_cur_sectors(req), blk_rq_sectors(req),
 			rq_data_dir(req) ? "write" : "read");
 
-	if (blkif_queue_request(req, 0)) {
+	if (blkif_queue_request(req, rinfo->hctx_index)) {
 wait:
 		/* Avoid pointless unplugs. */
 		blk_mq_stop_hw_queue(hctx);
@@ -687,7 +690,7 @@ wait:
 		return BLK_MQ_RQ_QUEUE_BUSY;
 	}
 
-	flush_requests(info, 0);
+	flush_requests(info, rinfo->hctx_index);
 	spin_unlock_irq(&info->io_lock);
 	return BLK_MQ_RQ_QUEUE_OK;
 }
@@ -695,6 +698,11 @@ wait:
 static int blkfront_init_hctx(struct blk_mq_hw_ctx *hctx, void *data,
 			  unsigned int index)
 {
+	struct blkfront_info *info = (struct blkfront_info *)data;
+
+	hctx->driver_data = &info->rinfo[index];
+	info->rinfo[index].hctx_index = index;
+
 	return 0;
 }
 
