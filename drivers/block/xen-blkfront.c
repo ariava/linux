@@ -98,7 +98,6 @@ static const struct block_device_operations xlvbd_block_fops;
 static unsigned int xen_blkif_max_segments = 32;
 module_param_named(max, xen_blkif_max_segments, int, S_IRUGO);
 MODULE_PARM_DESC(max, "Maximum amount of segments in indirect requests (default is 32)");
-static unsigned int hardware_queues = 1;
 
 #define BLK_RING_SIZE __CONST_RING_SIZE(blkif, PAGE_SIZE)
 
@@ -134,6 +133,7 @@ struct blkfront_info
 	unsigned int discard_granularity;
 	unsigned int discard_alignment;
 	unsigned int feature_persistent:1;
+	unsigned int feature_multiqueue:1;
 	unsigned int max_indirect_segments;
 	int is_ready;
 	/* Block layer tags. */
@@ -702,10 +702,10 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 	struct request_queue *rq;
 	struct blkfront_info *info = gd->private_data;
 
-	if (hardware_queues) {
+	if (info->feature_multiqueue) {
 		memset(&info->tag_set, 0, sizeof(info->tag_set));
 		info->tag_set.ops = &blkfront_mq_ops;
-		info->tag_set.nr_hw_queues = hardware_queues;
+		info->tag_set.nr_hw_queues = info->feature_multiqueue;
 		info->tag_set.queue_depth =  BLK_RING_SIZE;
 		info->tag_set.numa_node = NUMA_NO_NODE;
 		info->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
@@ -954,7 +954,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	spin_lock_irqsave(&info->io_lock, flags);
 
 	/* No more blkif_request(). */
-	if (hardware_queues)
+	if (info->feature_multiqueue)
 		blk_mq_stop_hw_queues(info->rq);
 	else
 		blk_stop_queue(info->rq);
@@ -983,7 +983,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 static void kick_pending_request_queues(struct blkfront_info *info)
 {
 	if (!RING_FULL(&info->ring)) {
-		if (hardware_queues) {
+		if (info->feature_multiqueue) {
 			blk_mq_start_stopped_hw_queues(info->rq, 0);
 		} else {
 			/* Re-enable calldowns. */
@@ -1016,7 +1016,7 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
 	/* No more blkif_request(). */
 	if (info->rq) {
-		if (hardware_queues)
+		if (info->feature_multiqueue)
 			blk_mq_stop_hw_queues(info->rq);
 		else
 			blk_stop_queue(info->rq);
@@ -1258,7 +1258,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
 				queue_flag_clear(QUEUE_FLAG_SECDISCARD, rq);
 			}
-			if (hardware_queues)
+			if (info->feature_multiqueue)
 				blk_mq_complete_request(req);
 			else
 				__blk_end_request_all(req, error);
@@ -1290,7 +1290,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				dev_dbg(&info->xbdev->dev, "Bad return from blkdev data "
 					"request: %x\n", bret->status);
 
-			if (hardware_queues)
+			if (info->feature_multiqueue)
 				blk_mq_complete_request(req);
 			else
 				__blk_end_request_all(req, error);
@@ -1954,6 +1954,9 @@ static void blkfront_connect(struct blkfront_info *info)
 				 info->xbdev->otherend);
 		return;
 	}
+
+	/* XXX actually gather this from the backend */
+	info->feature_multiqueue = 1;
 
 	err = xlvbd_alloc_gendisk(sectors, info, binfo, sector_size,
 				  physical_sector_size);
