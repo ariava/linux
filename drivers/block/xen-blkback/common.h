@@ -247,6 +247,8 @@ struct backend_info;
 
 /* Number of requests that we can fit in a ring */
 #define XEN_BLKIF_REQS			32
+#define XEN_RING_REQS(nr_rings)		((XEN_BLKIF_REQS / nr_rings > 4) ? \
+						XEN_BLKIF_REQS / nr_rings : 4)
 
 struct persistent_gnt {
 	struct page *page;
@@ -257,32 +259,29 @@ struct persistent_gnt {
 	struct list_head remove_node;
 };
 
-struct xen_blkif {
-	/* Unique identifier for this interface. */
-	domid_t			domid;
-	unsigned int		handle;
+struct xen_blkif_ring {
+	union blkif_back_rings	blk_rings;
 	/* Physical parameters of the comms window. */
 	unsigned int		irq;
-	/* Comms information. */
-	enum blkif_protocol	blk_protocol;
-	union blkif_back_rings	blk_rings;
-	void			*blk_ring;
-	/* The VBD attached to this interface. */
-	struct xen_vbd		vbd;
-	/* Back pointer to the backend_info. */
-	struct backend_info	*be;
-	/* Private fields. */
-	spinlock_t		blk_ring_lock;
-	atomic_t		refcnt;
 
 	wait_queue_head_t	wq;
-	/* for barrier (drain) requests */
-	struct completion	drain_complete;
-	atomic_t		drain;
-	atomic_t		inflight;
 	/* One thread per one blkif. */
 	struct task_struct	*xenblkd;
 	unsigned int		waiting_reqs;
+	void			*blk_ring;
+	spinlock_t		blk_ring_lock;
+
+	struct work_struct	free_work;
+	/* Thread shutdown wait queue. */
+	wait_queue_head_t	shutdown_wq;
+
+	/* buffer of free pages to map grant refs */
+	spinlock_t		free_pages_lock;
+	int			free_pages_num;
+
+	/* used by the kworker that offload work from the persistent purge */
+	struct list_head	persistent_purge_list;
+	struct work_struct	persistent_purge_work;
 
 	/* tree to store persistent grants */
 	struct rb_root		persistent_gnts;
@@ -290,13 +289,6 @@ struct xen_blkif {
 	atomic_t		persistent_gnt_in_use;
 	unsigned long           next_lru;
 
-	/* used by the kworker that offload work from the persistent purge */
-	struct list_head	persistent_purge_list;
-	struct work_struct	persistent_purge_work;
-
-	/* buffer of free pages to map grant refs */
-	spinlock_t		free_pages_lock;
-	int			free_pages_num;
 	struct list_head	free_pages;
 
 	/* List of all 'pending_req' available */
@@ -304,20 +296,54 @@ struct xen_blkif {
 	/* And its spinlock. */
 	spinlock_t		pending_free_lock;
 	wait_queue_head_t	pending_free_wq;
+	atomic_t		inflight;
 
+	/* Private fields. */
+	atomic_t		refcnt;
+
+	struct xen_blkif	*blkif;
+	unsigned		ring_index;
+
+	spinlock_t		stats_lock;
 	/* statistics */
 	unsigned long		st_print;
-	unsigned long long			st_rd_req;
-	unsigned long long			st_wr_req;
-	unsigned long long			st_oo_req;
-	unsigned long long			st_f_req;
-	unsigned long long			st_ds_req;
-	unsigned long long			st_rd_sect;
-	unsigned long long			st_wr_sect;
+	unsigned long long	st_rd_req;
+	unsigned long long	st_wr_req;
+	unsigned long long	st_oo_req;
+	unsigned long long	st_f_req;
+	unsigned long long	st_ds_req;
+	unsigned long long	st_rd_sect;
+	unsigned long long	st_wr_sect;
+};
 
-	struct work_struct	free_work;
-	/* Thread shutdown wait queue. */
-	wait_queue_head_t	shutdown_wq;
+struct xen_blkif {
+	/* Unique identifier for this interface. */
+	domid_t			domid;
+	unsigned int		handle;
+	/* Comms information. */
+	enum blkif_protocol	blk_protocol;
+	/* The VBD attached to this interface. */
+	struct xen_vbd		vbd;
+	/* Rings for this device */
+	struct xen_blkif_ring	*rings;
+	unsigned int		allocated_rings;
+	/* Back pointer to the backend_info. */
+	struct backend_info	*be;
+
+	/* for barrier (drain) requests */
+	struct completion	drain_complete;
+	atomic_t		drain;
+
+	atomic_t		refcnt;
+
+	/* statistics */
+	unsigned long long	st_rd_req;
+	unsigned long long	st_wr_req;
+	unsigned long long	st_oo_req;
+	unsigned long long	st_f_req;
+	unsigned long long	st_ds_req;
+	unsigned long long	st_rd_sect;
+	unsigned long long	st_wr_sect;
 };
 
 struct seg_buf {
@@ -339,7 +365,7 @@ struct grant_page {
  * response queued for it, with the saved 'id' passed back.
  */
 struct pending_req {
-	struct xen_blkif	*blkif;
+	struct xen_blkif_ring	*ring;
 	u64			id;
 	int			nr_pages;
 	atomic_t		pendcnt;
@@ -378,7 +404,7 @@ int xen_blkif_xenbus_init(void);
 irqreturn_t xen_blkif_be_int(int irq, void *dev_id);
 int xen_blkif_schedule(void *arg);
 int xen_blkif_purge_persistent(void *arg);
-void xen_blkbk_free_caches(struct xen_blkif *blkif);
+void xen_blkbk_free_caches(struct xen_blkif_ring *ring);
 
 int xen_blkbk_flush_diskcache(struct xenbus_transaction xbt,
 			      struct backend_info *be, int state);
