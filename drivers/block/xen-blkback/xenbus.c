@@ -479,15 +479,18 @@ static void xen_vbd_free(struct xen_vbd *vbd)
 	vbd->bdev = NULL;
 }
 
-static int xen_advertise_hw_queues(struct xen_blkif *blkif,
-				   struct request_queue *q)
+static int xen_advertise_hw_queues(struct xen_blkif *blkif)
 {
 	struct xen_vbd *vbd = &blkif->vbd;
 	struct xenbus_transaction xbt;
 	int err;
 
-	if (q && q->mq_ops)
-		vbd->nr_supported_hw_queues = q->nr_hw_queues;
+	/*
+	 * Set the number of supported hardware queues to the number of CPUs in
+	 * the driver domain: in this way, even I/O performed on a non-mq-
+	 * capable device can benefit from parallel processing of I/O requests.
+	 */
+	vbd->nr_supported_hw_queues = nr_cpu_ids;
 
 	err = xenbus_transaction_start(&xbt);
 	if (err) {
@@ -553,7 +556,7 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	if (q && blk_queue_secdiscard(q))
 		vbd->discard_secure = true;
 
-	err = xen_advertise_hw_queues(blkif, q);
+	err = xen_advertise_hw_queues(blkif);
 	if (err)
 		return -ENOENT;
 
