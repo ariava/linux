@@ -477,6 +477,34 @@ static void xen_vbd_free(struct xen_vbd *vbd)
 	vbd->bdev = NULL;
 }
 
+static int xen_advertise_hw_queues(struct xen_blkif *blkif,
+				   struct request_queue *q)
+{
+	struct xen_vbd *vbd = &blkif->vbd;
+	struct xenbus_transaction xbt;
+	int err;
+
+	if (q && q->mq_ops)
+		vbd->nr_supported_hw_queues = q->nr_hw_queues;
+
+	err = xenbus_transaction_start(&xbt);
+	if (err) {
+		BUG_ON(!blkif->be);
+		xenbus_dev_fatal(blkif->be->dev, err, "starting transaction (hw queues)");
+		return err;
+	}
+
+	err = xenbus_printf(xbt, blkif->be->dev->nodename, "nr_supported_hw_queues", "%u",
+			    blkif->vbd.nr_supported_hw_queues);
+	if (err)
+		xenbus_dev_error(blkif->be->dev, err, "writing %s/nr_supported_hw_queues",
+				 blkif->be->dev->nodename);
+
+	xenbus_transaction_end(xbt, 0);
+
+	return err;
+}
+
 static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 			  unsigned major, unsigned minor, int readonly,
 			  int cdrom)
@@ -484,6 +512,7 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	struct xen_vbd *vbd;
 	struct block_device *bdev;
 	struct request_queue *q;
+	int err;
 
 	vbd = &blkif->vbd;
 	vbd->handle   = handle;
@@ -521,6 +550,10 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 
 	if (q && blk_queue_secdiscard(q))
 		vbd->discard_secure = true;
+
+	err = xen_advertise_hw_queues(blkif, q);
+	if (err)
+		return -ENOENT;
 
 	DPRINTK("Successful creation of handle=%04x (dom=%u)\n",
 		handle, blkif->domid);
@@ -935,7 +968,16 @@ static int connect_ring(struct backend_info *be)
 
 	DPRINTK("%s", dev->otherend);
 
-	blkif->nr_rings = 1;
+	err = xenbus_gather(XBT_NIL, dev->otherend, "nr_blk_rings",
+			    "%u", &blkif->nr_rings, NULL);
+	if (err) {
+		/*
+		 * Frontend does not support multiqueue; force compatibility
+		 * mode of the driver.
+		 */
+		blkif->vbd.nr_supported_hw_queues = 0;
+		blkif->nr_rings = 1;
+	}
 
 	ring_ref = kzalloc(sizeof(unsigned long) * blkif->nr_rings, GFP_KERNEL);
 	if (!ring_ref)
