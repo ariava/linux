@@ -37,6 +37,7 @@
 
 #include <linux/interrupt.h>
 #include <linux/blkdev.h>
+#include <linux/blk-mq.h>
 #include <linux/hdreg.h>
 #include <linux/cdrom.h>
 #include <linux/module.h>
@@ -98,6 +99,15 @@ static unsigned int xen_blkif_max_segments = 32;
 module_param_named(max, xen_blkif_max_segments, int, S_IRUGO);
 MODULE_PARM_DESC(max, "Maximum amount of segments in indirect requests (default is 32)");
 
+/*
+ * Maximum number of per-interface I/O rings.
+ */
+
+static unsigned int xen_blkif_max_rings = 64;
+module_param_named(xen_blkif_max_rings, xen_blkif_max_rings, uint, 0644);
+MODULE_PARM_DESC(xen_blkif_max_rings,
+		 "Maximum number of I/O rings per virtual disk");
+
 #define BLK_RING_SIZE __CONST_RING_SIZE(blkif, PAGE_SIZE)
 
 /*
@@ -117,6 +127,8 @@ struct blkfront_info
 	int ring_ref;
 	struct blkif_front_ring ring;
 	unsigned int evtchn, irq;
+	unsigned int nr_allocated_rings, nr_rings;
+	struct blkfront_ring_info *rinfo;
 	struct request_queue *rq;
 	struct work_struct work;
 	struct gnttab_free_callback callback;
@@ -131,8 +143,11 @@ struct blkfront_info
 	unsigned int discard_granularity;
 	unsigned int discard_alignment;
 	unsigned int feature_persistent:1;
+	unsigned int available_hw_queues;
 	unsigned int max_indirect_segments;
 	int is_ready;
+	/* Block layer tags. */
+	struct blk_mq_tag_set tag_set;
 };
 
 static unsigned int nr_minors;
@@ -388,6 +403,7 @@ static int blkif_ioctl(struct block_device *bdev, fmode_t mode,
 static int blkif_queue_request(struct request *req)
 {
 	struct blkfront_info *info = req->rq_disk->private_data;
+	struct blkif_front_ring *ring = &info->ring;
 	struct blkif_request *ring_req;
 	unsigned long id;
 	unsigned int fsect, lsect;
@@ -433,7 +449,7 @@ static int blkif_queue_request(struct request *req)
 		new_persistent_gnts = 0;
 
 	/* Fill out a communications ring structure. */
-	ring_req = RING_GET_REQUEST(&info->ring, info->ring.req_prod_pvt);
+	ring_req = RING_GET_REQUEST(ring, ring->req_prod_pvt);
 	id = get_id_from_freelist(info);
 	info->shadow[id].request = req;
 
@@ -571,7 +587,7 @@ static int blkif_queue_request(struct request *req)
 			kunmap_atomic(segments);
 	}
 
-	info->ring.req_prod_pvt++;
+	ring->req_prod_pvt++;
 
 	/* Keep a private copy so we can reissue requests when recovering. */
 	info->shadow[id].req = *ring_req;
@@ -603,53 +619,41 @@ static inline bool blkif_request_flush_invalid(struct request *req,
 		 !(info->feature_flush & REQ_FUA)));
 }
 
-/*
- * do_blkif_request
- *  read a block; request is in a request queue
- */
-static void do_blkif_request(struct request_queue *rq)
+static int blkfront_queue_rq(struct blk_mq_hw_ctx *hctx,
+			     const struct blk_mq_queue_data *qd)
 {
-	struct blkfront_info *info = NULL;
-	struct request *req;
-	int queued;
+	struct blkfront_info *info = qd->rq->rq_disk->private_data;
 
-	pr_debug("Entered do_blkif_request\n");
+	spin_lock_irq(&info->io_lock);
+	if (RING_FULL(&info->ring))
+		goto wait;
 
-	queued = 0;
-
-	while ((req = blk_peek_request(rq)) != NULL) {
-		info = req->rq_disk->private_data;
-
-		if (RING_FULL(&info->ring))
-			goto wait;
-
-		blk_start_request(req);
-
-		if (blkif_request_flush_invalid(req, info)) {
-			__blk_end_request_all(req, -EOPNOTSUPP);
-			continue;
-		}
-
-		pr_debug("do_blk_req %p: cmd %p, sec %lx, "
-			 "(%u/%u) [%s]\n",
-			 req, req->cmd, (unsigned long)blk_rq_pos(req),
-			 blk_rq_cur_sectors(req), blk_rq_sectors(req),
-			 rq_data_dir(req) ? "write" : "read");
-
-		if (blkif_queue_request(req)) {
-			blk_requeue_request(rq, req);
-wait:
-			/* Avoid pointless unplugs. */
-			blk_stop_queue(rq);
-			break;
-		}
-
-		queued++;
+	if (blkif_request_flush_invalid(qd->rq, info)) {
+		spin_unlock_irq(&info->io_lock);
+		return BLK_MQ_RQ_QUEUE_ERROR;
 	}
 
-	if (queued != 0)
+	if (blkif_queue_request(qd->rq)) {
+		blk_mq_requeue_request(qd->rq);
+		goto wait;
+	}
+
+	if (qd->last)
 		flush_requests(info);
+	spin_unlock_irq(&info->io_lock);
+	return BLK_MQ_RQ_QUEUE_OK;
+
+wait:
+	/* Avoid pointless unplugs. */
+	spin_unlock_irq(&info->io_lock);
+	blk_mq_stop_hw_queue(hctx);
+	return BLK_MQ_RQ_QUEUE_BUSY;
 }
+
+static struct blk_mq_ops blkfront_mq_ops = {
+	.queue_rq = blkfront_queue_rq,
+	.map_queue = blk_mq_map_queue,
+};
 
 static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 				unsigned int physical_sector_size,
@@ -657,10 +661,33 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 {
 	struct request_queue *rq;
 	struct blkfront_info *info = gd->private_data;
+	int ret;
 
-	rq = blk_init_queue(do_blkif_request, &info->io_lock);
-	if (rq == NULL)
-		return -1;
+	info->tag_set.ops = &blkfront_mq_ops;
+	info->tag_set.nr_hw_queues = info->nr_rings;
+	/*
+	 * TODO: Need to figure out how to square this with
+	 * 'xen_blkif_max_segments'
+	 */
+	info->tag_set.queue_depth = BLK_RING_SIZE;
+	info->tag_set.numa_node = NUMA_NO_NODE;
+	info->tag_set.flags = BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
+	/*
+	 * And the reason we want it set to zero is because we want to be
+	 * responsible for page recycling (in case it is persistent and we
+	 * need to manually deal with unmapping it, etc).
+	 */
+	info->tag_set.cmd_size = 0;
+	info->tag_set.driver_data = info;
+
+	if ((ret = blk_mq_alloc_tag_set(&info->tag_set)))
+		return ret;
+	rq = blk_mq_init_queue(&info->tag_set);
+	if (IS_ERR(rq)) {
+		blk_mq_free_tag_set(&info->tag_set);
+		return PTR_ERR(rq);
+	}
+	rq->queuedata = info;
 
 	queue_flag_set_unlocked(QUEUE_FLAG_VIRT, rq);
 
@@ -896,7 +923,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	spin_lock_irqsave(&info->io_lock, flags);
 
 	/* No more blkif_request(). */
-	blk_stop_queue(info->rq);
+	blk_mq_stop_hw_queues(info->rq);
 
 	/* No more gnttab callback work. */
 	gnttab_cancel_free_callback(&info->callback);
@@ -912,30 +939,28 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	xlbd_release_minors(minor, nr_minors);
 
 	blk_cleanup_queue(info->rq);
+	blk_mq_free_tag_set(&info->tag_set);
 	info->rq = NULL;
 
 	put_disk(info->gd);
 	info->gd = NULL;
 }
 
+/* Must be called with io_lock held */
 static void kick_pending_request_queues(struct blkfront_info *info)
 {
 	if (!RING_FULL(&info->ring)) {
-		/* Re-enable calldowns. */
-		blk_start_queue(info->rq);
-		/* Kick things off immediately. */
-		do_blkif_request(info->rq);
+		blk_mq_start_stopped_hw_queues(info->rq, 0);
 	}
 }
 
 static void blkif_restart_queue(struct work_struct *work)
 {
-	struct blkfront_info *info = container_of(work, struct blkfront_info, work);
+	struct blkfront_info *info = container_of(work,
+				     struct blkfront_info, work);
 
-	spin_lock_irq(&info->io_lock);
 	if (info->connected == BLKIF_STATE_CONNECTED)
 		kick_pending_request_queues(info);
-	spin_unlock_irq(&info->io_lock);
 }
 
 static void blkif_free(struct blkfront_info *info, int suspend)
@@ -950,7 +975,7 @@ static void blkif_free(struct blkfront_info *info, int suspend)
 		BLKIF_STATE_SUSPENDED : BLKIF_STATE_DISCONNECTED;
 	/* No more blkif_request(). */
 	if (info->rq)
-		blk_stop_queue(info->rq);
+		blk_mq_stop_hw_queues(info->rq);
 
 	/* Remove all persistent grants */
 	if (!list_empty(&info->grants)) {
@@ -1029,6 +1054,7 @@ free_shadow:
 	gnttab_cancel_free_callback(&info->callback);
 	spin_unlock_irq(&info->io_lock);
 
+
 	/* Flush gnttab callback work. Must be done with no locks held. */
 	flush_work(&info->work);
 
@@ -1042,7 +1068,6 @@ free_shadow:
 	if (info->irq)
 		unbind_from_irqhandler(info->irq, info);
 	info->evtchn = info->irq = 0;
-
 }
 
 static void blkif_completion(struct blk_shadow *s, struct blkfront_info *info,
@@ -1118,8 +1143,10 @@ static void blkif_completion(struct blk_shadow *s, struct blkfront_info *info,
 				 * Add the used indirect page back to the list of
 				 * available pages for indirect grefs.
 				 */
-				indirect_page = pfn_to_page(s->indirect_grants[i]->pfn);
-				list_add(&indirect_page->lru, &info->indirect_pages);
+				if (!info->feature_persistent && info->max_indirect_segments) {
+					indirect_page = pfn_to_page(s->indirect_grants[i]->pfn);
+					list_add(&indirect_page->lru, &info->indirect_pages);
+				}
 				s->indirect_grants[i]->gref = GRANT_INVALID_REF;
 				list_add_tail(&s->indirect_grants[i]->node, &info->grants);
 			}
@@ -1134,7 +1161,6 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 	RING_IDX i, rp;
 	unsigned long flags;
 	struct blkfront_info *info = (struct blkfront_info *)dev_id;
-	int error;
 
 	spin_lock_irqsave(&info->io_lock, flags);
 
@@ -1175,37 +1201,37 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 			continue;
 		}
 
-		error = (bret->status == BLKIF_RSP_OKAY) ? 0 : -EIO;
+		req->errors = (bret->status == BLKIF_RSP_OKAY) ? 0 : -EIO;
 		switch (bret->operation) {
 		case BLKIF_OP_DISCARD:
 			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP)) {
 				struct request_queue *rq = info->rq;
 				printk(KERN_WARNING "blkfront: %s: %s op failed\n",
 					   info->gd->disk_name, op_name(bret->operation));
-				error = -EOPNOTSUPP;
+				req->errors = -EOPNOTSUPP;
 				info->feature_discard = 0;
 				info->feature_secdiscard = 0;
 				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
 				queue_flag_clear(QUEUE_FLAG_SECDISCARD, rq);
 			}
-			__blk_end_request_all(req, error);
+			blk_mq_complete_request(req);
 			break;
 		case BLKIF_OP_FLUSH_DISKCACHE:
 		case BLKIF_OP_WRITE_BARRIER:
 			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP)) {
 				printk(KERN_WARNING "blkfront: %s: %s op failed\n",
 				       info->gd->disk_name, op_name(bret->operation));
-				error = -EOPNOTSUPP;
+				req->errors = -EOPNOTSUPP;
 			}
 			if (unlikely(bret->status == BLKIF_RSP_ERROR &&
 				     info->shadow[id].req.u.rw.nr_segments == 0)) {
 				printk(KERN_WARNING "blkfront: %s: empty %s op failed\n",
 				       info->gd->disk_name, op_name(bret->operation));
-				error = -EOPNOTSUPP;
+				req->errors = -EOPNOTSUPP;
 			}
-			if (unlikely(error)) {
-				if (error == -EOPNOTSUPP)
-					error = 0;
+			if (unlikely(req->errors)) {
+				if (req->errors == -EOPNOTSUPP)
+					req->errors = 0;
 				info->feature_flush = 0;
 				xlvbd_flush(info);
 			}
@@ -1216,7 +1242,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 				dev_dbg(&info->xbdev->dev, "Bad return from blkdev data "
 					"request: %x\n", bret->status);
 
-			__blk_end_request_all(req, error);
+			blk_mq_complete_request(req);
 			break;
 		default:
 			BUG();
@@ -1233,7 +1259,7 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 	} else
 		info->ring.sring->rsp_event = i + 1;
 
-	kick_pending_request_queues(info);
+	blkif_restart_queue_callback(info);
 
 	spin_unlock_irqrestore(&info->io_lock, flags);
 
@@ -1287,7 +1313,8 @@ fail:
 
 /* Common code used when first setting up, and when resuming. */
 static int talk_to_blkback(struct xenbus_device *dev,
-			   struct blkfront_info *info)
+			   struct blkfront_info *info,
+			   unsigned int nr_rings)
 {
 	const char *message = NULL;
 	struct xenbus_transaction xbt;
@@ -1311,12 +1338,14 @@ again:
 		message = "writing ring-ref";
 		goto abort_transaction;
 	}
+
 	err = xenbus_printf(xbt, dev->nodename,
 			    "event-channel", "%u", info->evtchn);
 	if (err) {
 		message = "writing event-channel";
 		goto abort_transaction;
 	}
+
 	err = xenbus_printf(xbt, dev->nodename, "protocol", "%s",
 			    XEN_IO_PROTO_ABI_NATIVE);
 	if (err) {
@@ -1372,7 +1401,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 				   "%i", &vdevice);
 		if (err != 1) {
 			xenbus_dev_fatal(dev, err, "reading virtual-device");
-			return err;
+			goto out;
 		}
 	}
 
@@ -1392,23 +1421,28 @@ static int blkfront_probe(struct xenbus_device *dev,
 				printk(KERN_INFO
 						"%s: HVM does not support vbd %d as xen block device\n",
 						__FUNCTION__, vdevice);
-				return -ENODEV;
+				err = -ENODEV;
+				goto out;
 			}
 		}
 		/* do not create a PV cdrom device if we are an HVM guest */
 		type = xenbus_read(XBT_NIL, dev->nodename, "device-type", &len);
-		if (IS_ERR(type))
-			return -ENODEV;
+		if (IS_ERR(type)) {
+			err = -ENODEV;
+			goto out;
+		}
 		if (strncmp(type, "cdrom", 5) == 0) {
 			kfree(type);
-			return -ENODEV;
+			err = -ENODEV;
+			goto out;
 		}
 		kfree(type);
 	}
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
 		xenbus_dev_fatal(dev, -ENOMEM, "allocating info structure");
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto out;
 	}
 
 	mutex_init(&info->mutex);
@@ -1429,14 +1463,17 @@ static int blkfront_probe(struct xenbus_device *dev,
 	info->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
 	dev_set_drvdata(&dev->dev, info);
 
-	err = talk_to_blkback(dev, info);
+	err = talk_to_blkback(dev, info, info->nr_rings);
 	if (err) {
 		kfree(info);
 		dev_set_drvdata(&dev->dev, NULL);
-		return err;
+		goto out;
 	}
 
-	return 0;
+	err = 0;
+
+out:
+	return err;
 }
 
 static void split_bio_end(struct bio *bio, int error)
@@ -1467,6 +1504,9 @@ static int blkif_recover(struct blkfront_info *info)
 	struct split_bio *split_bio;
 	struct list_head requests;
 
+	bio_list_init(&bio_list);
+	INIT_LIST_HEAD(&requests);
+
 	/* Stage 1: Make a safe copy of the shadow state. */
 	copy = kmemdup(info->shadow, sizeof(info->shadow),
 		       GFP_NOIO | __GFP_REPEAT | __GFP_HIGH);
@@ -1485,6 +1525,9 @@ static int blkif_recover(struct blkfront_info *info)
 		kfree(copy);
 		return rc;
 	}
+
+	segs = info->max_indirect_segments ? : BLKIF_MAX_SEGMENTS_PER_REQUEST;
+	blk_queue_max_segments(info->rq, segs);
 
 	segs = info->max_indirect_segments ? : BLKIF_MAX_SEGMENTS_PER_REQUEST;
 	blk_queue_max_segments(info->rq, segs);
@@ -1513,30 +1556,7 @@ static int blkif_recover(struct blkfront_info *info)
 		copy[i].request->bio = NULL;
 		blk_put_request(copy[i].request);
 	}
-
 	kfree(copy);
-
-	/*
-	 * Empty the queue, this is important because we might have
-	 * requests in the queue with more segments than what we
-	 * can handle now.
-	 */
-	spin_lock_irq(&info->io_lock);
-	while ((req = blk_fetch_request(info->rq)) != NULL) {
-		if (req->cmd_flags &
-		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
-			list_add(&req->queuelist, &requests);
-			continue;
-		}
-		merge_bio.head = req->bio;
-		merge_bio.tail = req->biotail;
-		bio_list_merge(&bio_list, &merge_bio);
-		req->bio = NULL;
-		if (req->cmd_flags & (REQ_FLUSH | REQ_FUA))
-			pr_alert("diskcache flush request found!\n");
-		__blk_put_request(info->rq, req);
-	}
-	spin_unlock_irq(&info->io_lock);
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
@@ -1552,8 +1572,10 @@ static int blkif_recover(struct blkfront_info *info)
 		/* Requeue pending requests (flush or discard) */
 		list_del_init(&req->queuelist);
 		BUG_ON(req->nr_phys_segments > segs);
-		blk_requeue_request(info->rq, req);
+		blk_mq_requeue_request(req);
 	}
+	blk_mq_kick_requeue_list(info->rq);
+
 	spin_unlock_irq(&info->io_lock);
 
 	while ((bio = bio_list_pop(&bio_list)) != NULL) {
@@ -1607,7 +1629,7 @@ static int blkfront_resume(struct xenbus_device *dev)
 
 	blkif_free(info, info->connected == BLKIF_STATE_CONNECTED);
 
-	err = talk_to_blkback(dev, info);
+	err = talk_to_blkback(dev, info, info->nr_rings);
 
 	/*
 	 * We have to wait for the backend to switch to
@@ -1787,6 +1809,7 @@ static void blkfront_connect(struct blkfront_info *info)
 
 		return;
 	case BLKIF_STATE_SUSPENDED:
+	{
 		/*
 		 * If we are recovering from suspension, we need to wait
 		 * for the backend to announce it's features before
@@ -1794,8 +1817,9 @@ static void blkfront_connect(struct blkfront_info *info)
 		 * supports indirect descriptors, and how many.
 		 */
 		blkif_recover(info);
-		return;
 
+		return;
+	}
 	default:
 		break;
 	}
@@ -1883,11 +1907,10 @@ static void blkfront_connect(struct blkfront_info *info)
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
 
-	/* Kick pending requests. */
-	spin_lock_irq(&info->io_lock);
 	info->connected = BLKIF_STATE_CONNECTED;
+
+	/* Kick pending requests. */
 	kick_pending_request_queues(info);
-	spin_unlock_irq(&info->io_lock);
 
 	add_disk(info->gd);
 
