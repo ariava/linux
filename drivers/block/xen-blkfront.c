@@ -1473,6 +1473,14 @@ again:
 	return err;
 }
 
+static inline int blkfront_gather_hw_queues(struct blkfront_info *info,
+					    unsigned int *hw_queues)
+{
+	return xenbus_gather(XBT_NIL, info->xbdev->otherend,
+			     "available_hw_queues", "%u", hw_queues,
+			     NULL);
+}
+
 /**
  * Entry point to this code when a new device is created.  Allocate the basic
  * structures and the ring buffer for communication with the backend, and
@@ -1484,6 +1492,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 {
 	int err, vdevice, i, r;
 	struct blkfront_info *info;
+	unsigned int hw_queues;
 
 	/* FIXME: Use dynamic device id if this is not set. */
 	err = xenbus_scanf(XBT_NIL, dev->nodename,
@@ -1547,10 +1556,23 @@ static int blkfront_probe(struct xenbus_device *dev,
 	info->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
 	dev_set_drvdata(&dev->dev, info);
 
-	/* Set the number of rings. */
-	info->nr_rings = 1;
-	pr_info("blkfront: %s: %d rings\n",
-		info->gd->disk_name, info->nr_rings);
+	/* Gather the number of hardware queues as soon as possible */
+	err = blkfront_gather_hw_queues(info, &hw_queues);
+	if (err)
+		info->available_hw_queues = 0; /*
+						* backend cannot handle
+						* multiple I/O rings
+						*/
+	else
+		info->available_hw_queues = hw_queues;
+	/*
+	 * The backend has told us the number of hw queues he exposes.
+	 * Allocate the correct number of rings.
+	 */
+	info->nr_rings = min(min(info->available_hw_queues, num_online_cpus()),
+			     xen_blkif_max_rings) ? : 1;
+	pr_debug("blkfront: %d requested rings, %d rings\n",
+			info->available_hw_queues, info->nr_rings);
 
 	info->rinfo = kzalloc(info->nr_rings *
 			      sizeof(struct blkfront_ring_info),
@@ -1623,6 +1645,8 @@ static int blkif_setup_shadow(struct blkfront_ring_info *rinfo,
 	return 0;
 }
 
+static void blkif_remap_rings(struct blkfront_info *info, unsigned int nr_rings);
+
 static int blkif_recover(struct blkfront_info *info)
 {
 	int i, r;
@@ -1635,6 +1659,8 @@ static int blkif_recover(struct blkfront_info *info)
 	int pending, size;
 	struct split_bio *split_bio;
 	struct list_head requests;
+	unsigned int new_nr_rings = info->available_hw_queues ?
+		min(info->available_hw_queues, info->rq->nr_hw_queues) : 1;
 
 	bio_list_init(&bio_list);
 	INIT_LIST_HEAD(&requests);
@@ -1674,6 +1700,19 @@ static int blkif_recover(struct blkfront_info *info)
 			blk_put_request(copy[i].request);
 		}
 		kfree(copy);
+	}
+
+	blkif_remap_rings(info, new_nr_rings);
+
+	/*
+	 * Must set up indirect here as we must wait for the backend to
+	 * advertise the number of indirect segs it supports.
+	 */
+	for (r = 0 ; r < info->nr_rings ; r++) {
+		rc = blkfront_setup_indirect(&info->rinfo[r], segs);
+		if (rc) {
+			return rc;
+		}
 	}
 
 	xenbus_switch_state(info->xbdev, XenbusStateConnected);
@@ -1731,6 +1770,67 @@ static int blkif_recover(struct blkfront_info *info)
 	return 0;
 }
 
+static void blkif_try_reallocate_rings(struct blkfront_info *info,
+				       unsigned int nr_rings)
+{
+	unsigned int i, r, segs;
+
+	if (nr_rings == info->nr_rings)
+		return;
+
+	/* Avoid reallocating if we're shrinking the number of rings by now */
+	if (nr_rings > info->nr_allocated_rings) {
+		info->rinfo = krealloc(info->rinfo,
+				nr_rings * sizeof(struct blkfront_ring_info),
+				GFP_KERNEL);
+		if (!info->rinfo) {
+			printk(KERN_CRIT "failed to reallocate rings for %s",
+			       info->gd->disk_name);
+			return;
+		}
+		info->nr_allocated_rings = nr_rings;
+	}
+
+	segs = blkfront_gather_indirect(info);
+	for (r = info->nr_rings ; r < nr_rings ; r++) {
+		struct blkfront_ring_info *rinfo = &info->rinfo[r];
+
+		/* Sanitize extended memory area */
+		memset(rinfo, 0, sizeof(*rinfo));
+		rinfo->info = info;
+		rinfo->persistent_gnts_c = 0;
+		INIT_LIST_HEAD(&rinfo->grants);
+		INIT_LIST_HEAD(&rinfo->indirect_pages);
+		INIT_WORK(&rinfo->work, blkif_restart_queue);
+		spin_lock_init(&rinfo->io_lock);
+		for (i = 0; i < BLK_RING_SIZE; i++)
+			rinfo->shadow[i].req.u.rw.id = i+1;
+		rinfo->shadow[BLK_RING_SIZE-1].req.u.rw.id = 0x0fffffff;
+	}
+
+	printk(KERN_INFO "blkfront: %s: nr rings %u -> %u\n",
+	       info->gd->disk_name, info->nr_rings, nr_rings);
+}
+
+static void blkif_remap_rings(struct blkfront_info *info, unsigned int nr_rings)
+{
+	unsigned int i, ring_idx = 0;
+	struct blk_mq_hw_ctx *hctx;
+
+	if (nr_rings == info->nr_rings)
+		return;
+
+	/* Update hctx-to-ring mapping before resubmitting any I/O */
+	queue_for_each_hw_ctx(info->rq, hctx, i) {
+		hctx->driver_data = &info->rinfo[ring_idx];
+		ring_idx++;
+		if (ring_idx >= nr_rings)
+			ring_idx = 0;
+	}
+
+	info->nr_rings = nr_rings;
+}
+
 /**
  * We are reconnecting to the backend, due to a suspend/resume, or a backend
  * driver restart.  We tear down our blkif structure and recreate it, but
@@ -1741,12 +1841,26 @@ static int blkfront_resume(struct xenbus_device *dev)
 {
 	struct blkfront_info *info = dev_get_drvdata(&dev->dev);
 	int err;
+	unsigned int nr_rings;
 
 	dev_dbg(&dev->dev, "blkfront_resume: %s\n", dev->nodename);
 
 	blkif_free(info, info->connected == BLKIF_STATE_CONNECTED);
 
-	err = talk_to_blkback(dev, info, info->nr_rings);
+	/* Re-negotiate number of I/O rings */
+	err = blkfront_gather_hw_queues(info, &info->available_hw_queues);
+	if (err < 0)
+		info->available_hw_queues = 0;
+	/*
+	 * Use the number of hardware contexts currently in use as a maximum
+	 * limit for the number of allocatable I/O rings.
+	 */
+	nr_rings = info->available_hw_queues ?
+		   min(info->available_hw_queues, info->rq->nr_hw_queues) : 1;
+
+	blkif_try_reallocate_rings(info, nr_rings);
+
+	err = talk_to_blkback(dev, info, nr_rings);
 
 	/*
 	 * We have to wait for the backend to switch to
