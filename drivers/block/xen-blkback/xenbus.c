@@ -480,6 +480,40 @@ static void xen_vbd_free(struct xen_vbd *vbd)
 	vbd->bdev = NULL;
 }
 
+static int xen_advertise_hw_queues(struct xen_blkif *blkif,
+				   struct request_queue *q)
+{
+	struct xen_vbd *vbd = &blkif->vbd;
+	struct xenbus_transaction xbt;
+	int err;
+
+	vbd->exposed_hw_queues = xen_blkif_max_rings ?
+				 min(xen_blkif_max_rings, num_online_cpus()) :
+				 num_online_cpus();
+
+	if (q && q->mq_ops)
+		vbd->exposed_hw_queues = min(vbd->exposed_hw_queues,
+					     q->nr_hw_queues);
+
+	err = xenbus_transaction_start(&xbt);
+	if (err) {
+		BUG_ON(!blkif->be);
+		xenbus_dev_fatal(blkif->be->dev, err,
+				 "starting transaction (requested rings)");
+		return err;
+	}
+
+	err = xenbus_printf(xbt, blkif->be->dev->nodename, "available_hw_queues", "%u",
+			    blkif->vbd.exposed_hw_queues);
+	if (err)
+		xenbus_dev_error(blkif->be->dev, err, "writing %s/available_hw_queues",
+				 blkif->be->dev->nodename);
+
+	xenbus_transaction_end(xbt, 0);
+
+	return err;
+}
+
 static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 			  unsigned major, unsigned minor, int readonly,
 			  int cdrom)
@@ -487,6 +521,7 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	struct xen_vbd *vbd;
 	struct block_device *bdev;
 	struct request_queue *q;
+	int err;
 
 	vbd = &blkif->vbd;
 	vbd->handle   = handle;
@@ -525,6 +560,9 @@ static int xen_vbd_create(struct xen_blkif *blkif, blkif_vdev_t handle,
 	if (q && blk_queue_secdiscard(q))
 		vbd->discard_secure = true;
 
+	err = xen_advertise_hw_queues(blkif, q);
+	if (err)
+		return -ENOENT;
 
 	DPRINTK("Successful creation of handle=%04x (dom=%u)\n",
 		handle, blkif->domid);
@@ -967,7 +1005,22 @@ static int connect_ring(struct backend_info *be)
 	be->blkif->vbd.feature_gnt_persistent = pers_grants;
 	be->blkif->vbd.overflow_max_grants = 0;
 
-	blkif->nr_rings = 1;
+	err = xenbus_scanf(XBT_NIL, dev->otherend, "nr_blk_rings",
+			   "%u", &blkif->nr_rings);
+	if (err < 0) {
+		pr_debug("Advertised %u queues, fronted deaf - using one ring.\n",
+			 blkif->vbd.exposed_hw_queues);
+		blkif->vbd.exposed_hw_queues = 0;
+		blkif->nr_rings = 1;
+	} else if (blkif->nr_rings > blkif->vbd.exposed_hw_queues) {
+		/* Buggy or malicious guest */
+		xenbus_dev_fatal(dev, err,
+				 "guest requested %u queues, "
+				 "exceeding the maximum of %u",
+				 blkif->nr_rings,
+				 blkif->vbd.exposed_hw_queues);
+		return -ENOENT;
+	}
 
 	blkif->rings = xen_blkif_ring_alloc(blkif, blkif->nr_rings);
 	if (!blkif->rings)
