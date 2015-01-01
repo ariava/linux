@@ -127,6 +127,30 @@ typedef uint64_t blkif_sector_t;
 #define BLKIF_OP_INDIRECT          6
 
 /*
+ * blk-mq support
+ *
+ * A multi-queue-capable backend will advertise the number of available
+ * hardware queues with the key "available_hw_queues". A multi-queue-capable
+ * frontend will decide the number of I/O rings to be actually allocated and
+ * will advertise their number with the key "nr_blk_rings". In case a mq-
+ * capable frontend runs on top of a non-mq-capable backend, it will fall
+ * back to using a single I/O ring. The backend, if supported, will read the
+ * advertised number of I/O rings and map them.
+ *
+ * The ring reference and event channel of the I/O rings are advertised by the
+ * frontend  with toplevel "ring-ref" and "event-channel" keys in case the
+ * backend does not have multi-queue support. If instead the backend is
+ * mq-capable, the ring reference and event channel of the rings are
+ * advertised per-ring under sub-keys having the name "queue-N", where N is
+ * the integer ID of the queue the keys belong to, indexed from zero.
+ *
+ * The backend keeps a maximum number of I/O rings to be mapped which is used
+ * as a safety threshold against potentially malicious or malfunctioning domUs.
+ * To the same purpose, the frontend also keeps a maximum number of rings that
+ * can be requested by the backend.
+ */
+
+/*
  * Maximum scatter/gather segments per request.
  * This is carefully chosen so that sizeof(struct blkif_ring) <= PAGE_SIZE.
  * NB. This could be 12 if the ring indexes weren't stored in the same page.
